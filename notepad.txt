@@ -1,0 +1,36 @@
+No, I meant in future development, for now I want to concentrate on testing my idea carefully, I have a database of these things, for example this ideas
+
+
+1. revert.finance backtester + polymarket Script
+
+1) modeling how that would be in terms of comparing different price ranges + finding most profitable one (in the past) with this price ranges -> finding best ones and use them
+
+3) calcualting il that needs to be covered with polymarket
+
+2) works only for Uniswap v3 but could show other compatible pools outcomes
+
+2. manual calcualtions (using uniswap v3 pools simulators) + polymarket Script (instead of 1.)
+
+1) pretty much same process as 1., but not automated
+
+Database
+
+1. Script that determines best range at this moment
+
+2. Automatically parse new prices of bets, outcomes
+
+3. Continuetion of 2.: track current *insured* postions, signal and track if even we didn't get to the range I already can close positiion because to sell bet USD > IL, or sell bet USD + fees > IL
+
+4. Continuetion of 3.: checking if i can *switch* to another pool, or price range since it's more "attractive" in terms of range, bets prices
+
+Questions
+
+- when wider range is better? Wider range = less IL = less cost of the bet
+
+Pivot ideas
+
+- selling insurance for people: using polymarket you can buy insurance -> depositing liquidity and getting payouts when you want
+
+- 2-volatile-tokens-pair: buying 4 hedges for 2 tokens -> getting more fees from it
+
+- in general trading using it, trading SOL in respect of SOL as underlying asset
