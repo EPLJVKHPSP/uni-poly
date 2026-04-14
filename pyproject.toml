@@ -1,0 +1,16 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: pure functions, no I/O",
+    "integration: requires mocked DB/HTTP",
+    "slow: long-running simulations",
+]
+addopts = "-v --tb=short --strict-markers"
+
+[tool.coverage.run]
+source = ["active_backtester", "db_utils", "il", "parser", "polymarket_history"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 60

@@ -7,8 +7,8 @@ from datetime import datetime, timezone, timedelta
 import os
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Load environment variables (.env should win over pre-set shell vars)
+load_dotenv(override=True)
 
 
 def to_decimal(value):

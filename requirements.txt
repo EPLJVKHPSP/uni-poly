@@ -1,3 +1,7 @@
 psycopg2-binary>=2.9.0
 requests>=2.28.0
 python-dotenv>=1.0.0
+plotly>=5.0.0
+pytest>=8.0.0
+pytest-cov>=5.0.0
+pytest-mock>=3.14.0

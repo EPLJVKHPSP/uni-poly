@@ -1,35 +1,17 @@
-"""
-Polymarket historical bet-price sync — backward-compatibility shim.
-
-All logic lives in ``polymarket_history_pkg``.  This file re-exports every
-symbol so existing imports and ``python polymarket_history.py`` keep working.
-
-The orchestration function ``sync_all_markets`` is defined here (rather than
-merely re-exported) so that ``@patch("polymarket_history.fetch_price_history")``
-in tests correctly intercepts calls made inside the function.
-"""
+"""DB schema management and sync orchestration for bet price history."""
 
 import os
-import time  # noqa: F401  — kept so @patch("polymarket_history.time.sleep") works
+import time
 import logging
-import requests  # noqa: F401  — kept so @patch("polymarket_history.requests.get") works
-import psycopg2
 
+import psycopg2
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
-from polymarket_history_pkg.clob_client import CLOB_BASE_URL, fetch_price_history  # noqa: F401
-from polymarket_history_pkg.sync import (
-    ensure_history_table,  # noqa: F401
-    upsert_price_history,  # noqa: F401
-)
+from .clob_client import fetch_price_history
 
 load_dotenv(override=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 
@@ -41,6 +23,52 @@ def get_db_connection():
         host=os.getenv("DB_HOST", "localhost"),
         port=int(os.getenv("DB_PORT", "5432")),
     )
+
+
+def ensure_history_table(cur):
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bet_price_history (
+            clob_token_id   TEXT        NOT NULL,
+            ts              TIMESTAMPTZ NOT NULL,
+            price           NUMERIC     NOT NULL,
+            PRIMARY KEY (clob_token_id, ts)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_bph_token_ts
+        ON bet_price_history(clob_token_id, ts)
+        """
+    )
+
+
+def upsert_price_history(cur, clob_token_id, history):
+    """Bulk-upsert price history rows."""
+    if not history:
+        return 0
+
+    dedup_by_ts = {}
+    for point in history:
+        ts = datetime.fromtimestamp(point["t"], tz=timezone.utc)
+        dedup_by_ts[ts] = point["p"]
+
+    rows = [(clob_token_id, ts, price) for ts, price in dedup_by_ts.items()]
+    rows.sort(key=lambda r: r[1])
+
+    from psycopg2.extras import execute_values
+
+    execute_values(
+        cur,
+        """
+        INSERT INTO bet_price_history (clob_token_id, ts, price)
+        VALUES %s
+        ON CONFLICT (clob_token_id, ts) DO UPDATE SET price = EXCLUDED.price
+        """,
+        rows,
+    )
+    return len(rows)
 
 
 def sync_all_markets(fidelity=60):
@@ -88,17 +116,3 @@ def sync_all_markets(fidelity=60):
         logger.info(f"\nDone. Total price points stored: {total_points}")
     finally:
         conn.close()
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Sync Polymarket historical bet prices")
-    parser.add_argument(
-        "--fidelity",
-        type=int,
-        default=60,
-        help="Data granularity in minutes (default: 60 = hourly)",
-    )
-    args = parser.parse_args()
-    sync_all_markets(fidelity=args.fidelity)
