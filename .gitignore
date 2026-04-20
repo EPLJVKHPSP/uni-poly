@@ -7,14 +7,22 @@ __pycache__/
 *.pyc
 *.pyo
 
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
 pgdata/
 
 node_modules/
 
 *.json.bak
 active_backtest_*.json
+active_backtest_results.json
 sweep_*.json
 backtest_results.json
 optimization_results.json
+
+logs/
 
 .DS_Store

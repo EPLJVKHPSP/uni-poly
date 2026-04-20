@@ -4,6 +4,7 @@ import json
 from decimal import Decimal
 import re
 from datetime import datetime, timezone, timedelta
+import time
 import os
 from dotenv import load_dotenv
 
@@ -299,237 +300,335 @@ def is_price_like_event(event):
     return any(good in text for good in INCLUDE_PRICE_KEYWORDS)
 
 
-# Fetch ALL active events from Polymarket Gamma API (paginated by limit/offset)
-url = "https://gamma-api.polymarket.com/events"
-all_events = []
-limit = 100
-offset = 0
-
-while True:
-    params = {
-        "order": "id",
-        "ascending": "false",
-        "closed": "false",  # only active/open events
-        "limit": limit,
-        "offset": offset,
-    }
-
-    response = requests.get(url, params=params)
-    response.raise_for_status()
-    data = response.json()
-
-    # Gamma API may return either a bare list or a dict with an "events" key
-    if isinstance(data, list):
-        batch = data
-    else:
-        batch = data.get("events", [])
-
-    if not batch:
-        break
-
-    all_events.extend(batch)
-    offset += limit
-
-
-events = all_events
-
-# Fetch ATH levels for configured underlyings from CoinGecko
-ath_by_symbol = fetch_ath_by_symbol()
-
-# Connect to PostgreSQL using environment variables or defaults
-conn = psycopg2.connect(
-    dbname=os.getenv("DB_NAME", "polymarket"),
-    user=os.getenv("DB_USER", "polymarket"),
-    password=os.getenv("DB_PASSWORD", "polymarket_pw"),
-    host=os.getenv("DB_HOST", "localhost"),
-    port=int(os.getenv("DB_PORT", "5432")),
-)
-
-cur = conn.cursor()
-
-# Create table if it doesn't exist (non-destructive)
-cur.execute(
+def fetch_events_keyset(*, closed: bool, end_date_min=None, tag_slug=None, max_events=None) -> list:
     """
-    CREATE TABLE IF NOT EXISTS price_events (
-        event_id        BIGINT,
-        event_slug      TEXT,
-        event_title     TEXT,
-        underlying      TEXT,
-        market_id       BIGINT,
-        market_question TEXT,
-        side            TEXT,
-        level           NUMERIC,
-        direction       TEXT,
-        price           NUMERIC,
-        event_volume    NUMERIC,
-        market_volume   NUMERIC,
-        end_date        TIMESTAMPTZ,
-        active          BOOLEAN,
-        clob_token_id   TEXT,
-        PRIMARY KEY (market_id, side)
+    Fetch events from Polymarket Gamma API using keyset pagination.
+
+    Note: the keyset endpoint rejects `offset`; use `after_cursor`/`next_cursor`.
+    """
+    url = "https://gamma-api.polymarket.com/events/keyset"
+    events: list = []
+    limit = 200
+    after_cursor = None
+
+    while True:
+        params = {
+            "order": "id",
+            "ascending": "false",
+            "closed": "true" if closed else "false",
+            "limit": limit,
+        }
+        if tag_slug:
+            params["tag_slug"] = tag_slug
+        if after_cursor:
+            params["after_cursor"] = after_cursor
+        if end_date_min is not None:
+            # Gamma expects RFC3339 / ISO-8601 date-time
+            params["end_date_min"] = end_date_min.isoformat().replace("+00:00", "Z")
+
+        data = None
+        last_err = None
+        for attempt in range(5):
+            try:
+                resp = requests.get(url, params=params, timeout=20)
+                resp.raise_for_status()
+                data = resp.json()
+                last_err = None
+                break
+            except requests.HTTPError as e:
+                last_err = e
+                status = getattr(e.response, "status_code", None)
+                if status is not None and status >= 500:
+                    time.sleep(1.0 + attempt * 1.5)
+                    continue
+                raise
+            except Exception as e:
+                last_err = e
+                time.sleep(1.0 + attempt * 1.5)
+        if data is None:
+            # Gamma sometimes returns intermittent 5xx on large keyset scans.
+            # For closed events we prefer partial data over blocking the whole ETL.
+            if closed:
+                break
+            raise last_err if last_err else RuntimeError("Gamma API returned no data")
+
+        if isinstance(data, list):
+            batch = data
+            next_cursor = None
+        else:
+            batch = data.get("events", []) or data.get("data", []) or []
+            next_cursor = data.get("next_cursor")
+
+        if not batch:
+            break
+
+        events.extend(batch)
+        if len(events) % 2000 == 0:
+            kind = "closed" if closed else "open"
+            print(f"[gamma] fetched {len(events)} {kind} events...")
+        if max_events is not None and len(events) >= int(max_events):
+            events = events[: int(max_events)]
+            break
+        if not next_cursor:
+            break
+        after_cursor = next_cursor
+
+    return events
+
+
+def sync_price_events():
+    # Connect to PostgreSQL using environment variables or defaults
+    conn = psycopg2.connect(
+        dbname=os.getenv("DB_NAME", "polymarket"),
+        user=os.getenv("DB_USER", "polymarket"),
+        password=os.getenv("DB_PASSWORD", "polymarket_pw"),
+        host=os.getenv("DB_HOST", "localhost"),
+        port=int(os.getenv("DB_PORT", "5432")),
     )
-    """
-)
 
-# Create indexes for better query performance
-cur.execute(
-    """
-    CREATE INDEX IF NOT EXISTS idx_price_events_underlying 
-    ON price_events(underlying) WHERE active = true
-    """
-)
-cur.execute(
-    """
-    CREATE INDEX IF NOT EXISTS idx_price_events_level_direction 
-    ON price_events(underlying, level, direction, side) WHERE active = true
-    """
-)
-# Ensure a unique constraint exists for ON CONFLICT target
-cur.execute(
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_price_events_market_side
-    ON price_events(market_id, side)
-    """
-)
+    cur = conn.cursor()
 
-# Add clob_token_id column if it doesn't exist (migration for existing DBs)
-cur.execute(
-    """
-    DO $$
-    BEGIN
-        IF NOT EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_name = 'price_events' AND column_name = 'clob_token_id'
-        ) THEN
-            ALTER TABLE price_events ADD COLUMN clob_token_id TEXT;
-        END IF;
-    END $$
-    """
-)
-conn.commit()
+    # Fetch ATH levels for configured underlyings from CoinGecko
+    ath_by_symbol = fetch_ath_by_symbol()
 
-for event in events:
-    # Require a valid end_date and skip short-term markets (< 7 days from now)
-    end_date_str = event.get("endDate")
-    if not end_date_str:
-        continue
+    # Create table if it doesn't exist (non-destructive)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS price_events (
+            event_id        BIGINT,
+            event_slug      TEXT,
+            event_title     TEXT,
+            underlying      TEXT,
+            market_id       BIGINT,
+            market_question TEXT,
+            side            TEXT,
+            level           NUMERIC,
+            direction       TEXT,
+            price           NUMERIC,
+            event_volume    NUMERIC,
+            market_volume   NUMERIC,
+            end_date        TIMESTAMPTZ,
+            created_at      TIMESTAMPTZ,
+            closed_time     TIMESTAMPTZ,
+            active          BOOLEAN,
+            clob_token_id   TEXT,
+            PRIMARY KEY (market_id, side)
+        )
+        """
+    )
 
-    try:
-        end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-    except Exception:
-        continue
+    # Create indexes for better query performance
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_price_events_underlying 
+        ON price_events(underlying) WHERE active = true
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_price_events_level_direction 
+        ON price_events(underlying, level, direction, side) WHERE active = true
+        """
+    )
+    # Ensure a unique constraint exists for ON CONFLICT target
+    cur.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_price_events_market_side
+        ON price_events(market_id, side)
+        """
+    )
 
-    if end_dt - datetime.now(timezone.utc) < timedelta(days=7):
-        # Skip very short-term events (less than ~1 week)
-        continue
+    # Add clob_token_id column if it doesn't exist (migration for existing DBs)
+    cur.execute(
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'price_events' AND column_name = 'clob_token_id'
+            ) THEN
+                ALTER TABLE price_events ADD COLUMN clob_token_id TEXT;
+            END IF;
+        END $$
+        """
+    )
 
-    # Only keep clearly price-related events (no short-term up/down, no FDV)
-    if not is_price_like_event(event):
-        continue
+    # Add lifecycle columns if they don't exist (migration for existing DBs)
+    cur.execute(
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'price_events' AND column_name = 'created_at'
+            ) THEN
+                ALTER TABLE price_events ADD COLUMN created_at TIMESTAMPTZ;
+            END IF;
 
-    # Event-level volume
-    event_volume = to_decimal(event.get("volume"))
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'price_events' AND column_name = 'closed_time'
+            ) THEN
+                ALTER TABLE price_events ADD COLUMN closed_time TIMESTAMPTZ;
+            END IF;
+        END $$
+        """
+    )
+    conn.commit()
 
-    for market in event.get("markets", []):
-        market_id = market.get("id")
-        question = market.get("question")
+    # Fetch open + closed events (closed events are scoped to recent history to avoid huge pulls)
+    print("[gamma] fetching open events...")
+    open_events = fetch_events_keyset(closed=False, tag_slug="crypto")
+    print(f"[gamma] open events fetched: {len(open_events)}")
+    print("[gamma] fetching closed events...")
+    max_closed = os.getenv("MAX_CLOSED_EVENTS")
+    closed_events = fetch_events_keyset(
+        closed=True,
+        end_date_min=datetime.now(timezone.utc) - timedelta(days=180),
+        tag_slug="crypto",
+        max_events=int(max_closed) if max_closed not in (None, "", "null") else None,
+    )
+    print(f"[gamma] closed events fetched: {len(closed_events)}")
+    events = open_events + closed_events
+    print(f"[etl] total events to process: {len(events)}")
 
-        # Market-level volume
-        market_volume = to_decimal(market.get("volume"))
-
-        # Outcomes and prices are often JSON-encoded strings
-        raw_outcomes = market.get("outcomes")
-        outcomes = parse_json_list(raw_outcomes)
-
-        # Only keep binary Yes/No markets; skip bucketed or multi-outcome markets
-        if not outcomes:
+    written = 0
+    for event in events:
+        # Require a valid end_date
+        end_date_str = event.get("endDate")
+        if not end_date_str:
             continue
-        normalized_outcomes = [str(o).strip().lower() for o in outcomes]
-        if not (len(normalized_outcomes) == 2 and set(normalized_outcomes) == {"yes", "no"}):
-            # Skip markets where sides are not strictly Yes/No (e.g. buckets like '80k', '100k')
+
+        try:
+            end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+        except Exception:
             continue
 
-        raw_prices = market.get("outcomePrices")
-        prices_raw = parse_json_list(raw_prices)
+        is_closed_event = bool(event.get("closed"))
+        if not is_closed_event:
+            # For *open* events only, skip very short-term events (< ~1 week)
+            if end_dt - datetime.now(timezone.utc) < timedelta(days=7):
+                continue
 
-        # Coerce each price to Decimal (or None)
-        norm_prices = [to_decimal(p) for p in prices_raw]
-
-        # Extract CLOB token IDs (maps 1:1 with outcomes: [Yes_id, No_id])
-        raw_clob_ids = market.get("clobTokenIds")
-        clob_token_ids = parse_json_list(raw_clob_ids)
-
-        # Derive underlying symbol and level/direction from text
-        underlying = infer_underlying_symbol([event.get("title"), question])
-        if not underlying:
-            # Skip non-token-specific markets (e.g. MicroStrategy NAV, macro, etc.)
+        # Only keep clearly price-related events (no short-term up/down, no FDV)
+        if not is_price_like_event(event):
             continue
 
-        level, direction = infer_level_and_direction(question)
+        # Event-level volume
+        event_volume = to_decimal(event.get("volume"))
 
-        # If this is an all‑time‑high style market, always override the level with
-        # the CoinGecko ATH data (e.g. "Ethereum all time high by December 31?",
-        # "SOL ATH before 2026?"). We ignore any numeric values parsed from dates
-        # such as 2026, 2027, 31, etc.
-        combined_text = f"{(event.get('title') or '')} {question or ''}".lower()
-        if (
-            "all time high" in combined_text
-            or "all-time-high" in combined_text
-            or " ath" in combined_text
-        ):
-            ath_level = ath_by_symbol.get(underlying)
-            if ath_level is not None:
-                level = ath_level
-                # ATH questions are directionally "up" even if the wording was ambiguous
-                if direction == "unknown":
-                    direction = "up"
+        for market in event.get("markets", []):
+            market_id = market.get("id")
+            question = market.get("question")
 
-        # Insert or update one row per side (e.g. Yes / No)
-        for idx, (side, price) in enumerate(zip(outcomes, norm_prices)):
-            clob_token_id = clob_token_ids[idx] if idx < len(clob_token_ids) else None
-            cur.execute(
-                """
-                INSERT INTO price_events
-                (event_id, event_slug, event_title, underlying,
-                 market_id, market_question, side, level, direction,
-                 price, event_volume, market_volume, end_date, active,
-                 clob_token_id)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (market_id, side) 
-                DO UPDATE SET
-                    event_id = EXCLUDED.event_id,
-                    event_slug = EXCLUDED.event_slug,
-                    event_title = EXCLUDED.event_title,
-                    underlying = EXCLUDED.underlying,
-                    market_question = EXCLUDED.market_question,
-                    level = EXCLUDED.level,
-                    direction = EXCLUDED.direction,
-                    price = EXCLUDED.price,
-                    event_volume = EXCLUDED.event_volume,
-                    market_volume = EXCLUDED.market_volume,
-                    end_date = EXCLUDED.end_date,
-                    active = EXCLUDED.active,
-                    clob_token_id = EXCLUDED.clob_token_id
-                """,
-                (
-                    event.get("id"),
-                    event.get("slug") or "",
-                    event.get("title"),
-                    underlying,
-                    market_id,
-                    question,
-                    side,
-                    level,
-                    direction,
-                    price,
-                    event_volume,
-                    market_volume,
-                    end_date_str,
-                    event.get("active"),
-                    clob_token_id,
-                ),
-            )
+            market_created_at = market.get("createdAt")
+            market_closed_time = market.get("closedTime")
 
-conn.commit()
-cur.close()
-conn.close()
+            # Market-level volume
+            market_volume = to_decimal(market.get("volume"))
+
+            # Outcomes and prices are often JSON-encoded strings
+            raw_outcomes = market.get("outcomes")
+            outcomes = parse_json_list(raw_outcomes)
+
+            # Only keep binary Yes/No markets; skip bucketed or multi-outcome markets
+            if not outcomes:
+                continue
+            normalized_outcomes = [str(o).strip().lower() for o in outcomes]
+            if not (len(normalized_outcomes) == 2 and set(normalized_outcomes) == {"yes", "no"}):
+                # Skip markets where sides are not strictly Yes/No (e.g. buckets like '80k', '100k')
+                continue
+
+            raw_prices = market.get("outcomePrices")
+            prices_raw = parse_json_list(raw_prices)
+
+            # Coerce each price to Decimal (or None)
+            norm_prices = [to_decimal(p) for p in prices_raw]
+
+            # Extract CLOB token IDs (maps 1:1 with outcomes: [Yes_id, No_id])
+            raw_clob_ids = market.get("clobTokenIds")
+            clob_token_ids = parse_json_list(raw_clob_ids)
+
+            # Derive underlying symbol and level/direction from text
+            underlying = infer_underlying_symbol([event.get("title"), question])
+            if not underlying:
+                # Skip non-token-specific markets (e.g. MicroStrategy NAV, macro, etc.)
+                continue
+
+            level, direction = infer_level_and_direction(question)
+
+            # If this is an all‑time‑high style market, always override the level with CoinGecko ATH
+            combined_text = f"{(event.get('title') or '')} {question or ''}".lower()
+            if (
+                "all time high" in combined_text
+                or "all-time-high" in combined_text
+                or " ath" in combined_text
+            ):
+                ath_level = ath_by_symbol.get(underlying)
+                if ath_level is not None:
+                    level = ath_level
+                    if direction == "unknown":
+                        direction = "up"
+
+            # Insert or update one row per side (e.g. Yes / No)
+            for idx, (side, price) in enumerate(zip(outcomes, norm_prices)):
+                clob_token_id = clob_token_ids[idx] if idx < len(clob_token_ids) else None
+                cur.execute(
+                    """
+                    INSERT INTO price_events
+                    (event_id, event_slug, event_title, underlying,
+                     market_id, market_question, side, level, direction,
+                     price, event_volume, market_volume, end_date,
+                     created_at, closed_time,
+                     active, clob_token_id)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (market_id, side) 
+                    DO UPDATE SET
+                        event_id = EXCLUDED.event_id,
+                        event_slug = EXCLUDED.event_slug,
+                        event_title = EXCLUDED.event_title,
+                        underlying = EXCLUDED.underlying,
+                        market_question = EXCLUDED.market_question,
+                        level = EXCLUDED.level,
+                        direction = EXCLUDED.direction,
+                        price = EXCLUDED.price,
+                        event_volume = EXCLUDED.event_volume,
+                        market_volume = EXCLUDED.market_volume,
+                        end_date = EXCLUDED.end_date,
+                        created_at = EXCLUDED.created_at,
+                        closed_time = EXCLUDED.closed_time,
+                        active = EXCLUDED.active,
+                        clob_token_id = EXCLUDED.clob_token_id
+                    """,
+                    (
+                        event.get("id"),
+                        event.get("slug") or "",
+                        event.get("title"),
+                        underlying,
+                        market_id,
+                        question,
+                        side,
+                        level,
+                        direction,
+                        price,
+                        event_volume,
+                        market_volume,
+                        end_date_str,
+                        market_created_at,
+                        market_closed_time,
+                        event.get("active"),
+                        clob_token_id,
+                    ),
+                )
+                written += 1
+                if written % 2000 == 0:
+                    print(f"[db] upserted {written} rows...")
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    print(f"[done] upserted rows: {written}")
+
+
+if __name__ == "__main__":
+    sync_price_events()

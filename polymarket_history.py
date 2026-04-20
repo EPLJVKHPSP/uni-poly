@@ -56,24 +56,28 @@ def sync_all_markets(fidelity=60):
 
         cur.execute(
             """
-            SELECT DISTINCT clob_token_id, market_id, side, underlying, level, direction
+            SELECT DISTINCT clob_token_id, market_id, side, underlying, level, direction, active, closed_time
             FROM price_events
             WHERE clob_token_id IS NOT NULL
-              AND active = true
             ORDER BY underlying, level
             """
         )
         markets = cur.fetchall()
-        logger.info(f"Found {len(markets)} active markets with CLOB token IDs")
+        logger.info(f"Found {len(markets)} markets with CLOB token IDs")
 
         total_points = 0
-        for i, (clob_id, mkt_id, side, underlying, level, direction) in enumerate(markets, 1):
+        for i, row in enumerate(markets, 1):
+            clob_id, mkt_id, side, underlying, level, direction, *rest = row
+            active = rest[0] if len(rest) >= 1 else True
+            closed_time = rest[1] if len(rest) >= 2 else None
             logger.info(
                 f"[{i}/{len(markets)}] {underlying} {direction} ${level} "
                 f"({side}) market_id={mkt_id}"
             )
 
             history = fetch_price_history(clob_id, fidelity=fidelity)
+            if not history and (closed_time is not None or active is False):
+                history = fetch_price_history(clob_id, fidelity=720)
             if history:
                 count = upsert_price_history(cur, clob_id, history)
                 total_points += count
