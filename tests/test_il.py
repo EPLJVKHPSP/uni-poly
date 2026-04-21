@@ -3,7 +3,7 @@
 import math
 import pytest
 
-from il import tokens_from_liquidity, calculate_il_at_price
+from il import tokens_from_liquidity, calculate_il_at_price, liquidity_from_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -128,3 +128,80 @@ class TestCalculateIlAtPrice:
         )
         assert result["LP_value"] > 0
         assert result["HODL_value"] > 0
+
+    @pytest.mark.unit
+    def test_round_trip_with_consistent_tokens(self):
+        """When tokens come from a consistent V3 split, IL at entry is exactly 0
+        and LP value equals the deposit."""
+        price = 3000.0
+        min_r, max_r = 2000.0, 4000.0
+        t0, t1 = tokens_from_liquidity(price, min_r, max_r, liquidity=1_000_000)
+        deposit = t0 + t1 * price
+        r = calculate_il_at_price(price, t0, t1, price, min_r, max_r)
+        assert r["IL"] == pytest.approx(0.0, abs=1e-6)
+        assert r["LP_value"] == pytest.approx(deposit, rel=1e-9)
+
+    @pytest.mark.unit
+    def test_boundary_entry_lower_uses_non_zero_side(self):
+        """When entry is at the lower boundary, only token1 is deposited; the
+        old ``(L0+L1)/2`` trick would have returned half the true liquidity."""
+        price = 2000.0
+        min_r, max_r = 2000.0, 4000.0
+        _, t1 = tokens_from_liquidity(price, min_r, max_r, liquidity=1_000_000)
+        assert t1 > 0
+        r = calculate_il_at_price(price, 0.0, t1, price, min_r, max_r)
+        # LP value at entry equals HODL value of the ETH we just deposited.
+        assert r["LP_value"] == pytest.approx(t1 * price, rel=1e-9)
+        assert r["IL"] == pytest.approx(0.0, abs=1e-6)
+
+    @pytest.mark.unit
+    def test_boundary_entry_upper_uses_non_zero_side(self):
+        """Symmetric case: entry at the upper boundary, only token0 deposited."""
+        price = 4000.0
+        min_r, max_r = 2000.0, 4000.0
+        t0, _ = tokens_from_liquidity(price, min_r, max_r, liquidity=1_000_000)
+        assert t0 > 0
+        r = calculate_il_at_price(price, t0, 0.0, price, min_r, max_r)
+        assert r["LP_value"] == pytest.approx(t0, rel=1e-9)
+        assert r["IL"] == pytest.approx(0.0, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# liquidity_from_tokens
+# ---------------------------------------------------------------------------
+
+
+class TestLiquidityFromTokens:
+
+    @pytest.mark.unit
+    def test_recovers_liquidity_from_consistent_split(self):
+        price, min_r, max_r = 3000.0, 2000.0, 4000.0
+        L = 1_234_567.89
+        t0, t1 = tokens_from_liquidity(price, min_r, max_r, L)
+        assert liquidity_from_tokens(price, t0, t1, min_r, max_r) == pytest.approx(L, rel=1e-9)
+
+    @pytest.mark.unit
+    def test_uses_token1_when_token0_zero(self):
+        """At price == min_range, token0 = 0 — L must come from the token1 side."""
+        price, min_r, max_r = 2000.0, 2000.0, 4000.0
+        _, t1 = tokens_from_liquidity(price, min_r, max_r, 1e6)
+        assert liquidity_from_tokens(price, 0.0, t1, min_r, max_r) == pytest.approx(1e6, rel=1e-9)
+
+    @pytest.mark.unit
+    def test_uses_token0_when_token1_zero(self):
+        price, min_r, max_r = 4000.0, 2000.0, 4000.0
+        t0, _ = tokens_from_liquidity(price, min_r, max_r, 1e6)
+        assert liquidity_from_tokens(price, t0, 0.0, min_r, max_r) == pytest.approx(1e6, rel=1e-9)
+
+    @pytest.mark.unit
+    def test_picks_min_when_inputs_inconsistent(self):
+        """Uniswap itself uses min(L0, L1); excess tokens sit idle."""
+        price, min_r, max_r = 3000.0, 2500.0, 3500.0
+        t0, t1 = tokens_from_liquidity(price, min_r, max_r, 1.0)
+        L = liquidity_from_tokens(price, t0 * 2, t1, min_r, max_r)
+        # The smaller side (token1-derived L=1.0) wins.
+        assert L == pytest.approx(1.0, rel=1e-9)
+
+    @pytest.mark.unit
+    def test_zero_tokens_returns_zero(self):
+        assert liquidity_from_tokens(3000.0, 0.0, 0.0, 2000.0, 4000.0) == 0.0

@@ -3,8 +3,13 @@
 import sys
 from typing import Dict, Optional, Tuple
 
-from il import calculate_il_at_price
+from il import (
+    calculate_il_at_price,
+    liquidity_from_tokens,
+    tokens_from_liquidity,
+)
 
+from .polymarket_execution import SlippageConfig, apply_execution_costs
 from .fee_math import (
     _tokens_for_strategy_human,
     _tokens_for_strategy_scaled,
@@ -33,6 +38,11 @@ def open_position(
     price_token: int = 0,
     gas_prices: Optional[Dict[str, int]] = None,
     spread: float = 0.0,
+    slippage_cfg: Optional[SlippageConfig] = None,
+    lower_clob_token_id: Optional[str] = None,
+    upper_clob_token_id: Optional[str] = None,
+    lower_end_ts: Optional[int] = None,
+    upper_end_ts: Optional[int] = None,
 ) -> Dict:
     """Open a position using the full wallet. Returns position record."""
     close_price = float(candle["close"])
@@ -50,35 +60,65 @@ def open_position(
     deposit_value = wallet_value
     lower_mid = insurance_info["lower_bet_price"]
     upper_mid = insurance_info["upper_bet_price"]
-    lower_ask = min(lower_mid + spread / 2, 1.0)
-    upper_ask = min(upper_mid + spread / 2, 1.0)
+    # Executable prices include spread + optional size-aware slippage.
+    # Spread cost and slippage are tracked separately for transparency.
+    lower_exec_ask, lower_spread_cost, lower_slip_cost = apply_execution_costs(
+        mid_price=lower_mid,
+        spread=spread,
+        contracts=0.0,  # placeholder; updated once contracts are known
+        side="buy",
+        slippage_cfg=slippage_cfg,
+    )
+    upper_exec_ask, upper_spread_cost, upper_slip_cost = apply_execution_costs(
+        mid_price=upper_mid,
+        spread=spread,
+        contracts=0.0,
+        side="buy",
+        slippage_cfg=slippage_cfg,
+    )
 
+    # External-cost accounting is always ON:
+    # - gas + Polymarket insurance are NOT deducted from LP principal
+    # - only the in-pool rebalance swap fee (if any) reduces the LP deposit value
+    swap_fee = 0.0
+    swap_amount_usd = 0.0
     for _ in range(5):
-        t0, t1 = _tokens_for_strategy_human(min_range, max_range, deposit_value, entry_price)
-        il_lower = calculate_il_at_price(entry_price, t0, t1, min_range, min_range, max_range)
-        il_upper = calculate_il_at_price(entry_price, t0, t1, max_range, min_range, max_range)
-
-        lower_contracts = abs(min(0, il_lower["IL"]))
-        upper_contracts = abs(min(0, il_upper["IL"]))
-
-        lower_cost = lower_contracts * lower_ask
-        upper_cost = upper_contracts * upper_ask
-        total_insurance_cost = lower_cost + upper_cost
-
-        remaining = wallet_value - total_insurance_cost
-        if remaining <= 0:
-            return None
-
-        needed_usdc, _ = _tokens_for_strategy_human(min_range, max_range, remaining, entry_price)
-        wallet_usdc_after_ins = wallet["usdc"] - total_insurance_cost
-        swap_amount_usd = abs(wallet_usdc_after_ins - needed_usdc)
+        needed_usdc, _ = _tokens_for_strategy_human(min_range, max_range, deposit_value, entry_price)
+        swap_amount_usd = abs(wallet["usdc"] - needed_usdc)
         swap_fee = swap_amount_usd * swap_fee_rate
-
-        deposit_value = remaining - swap_fee - gas_open
+        deposit_value = wallet_value - swap_fee
         if deposit_value <= 0:
             return None
 
-    spread_cost_buy = (lower_ask - lower_mid) * lower_contracts + (upper_ask - upper_mid) * upper_contracts
+    t0, t1 = _tokens_for_strategy_human(min_range, max_range, deposit_value, entry_price)
+    il_lower = calculate_il_at_price(entry_price, t0, t1, min_range, min_range, max_range)
+    il_upper = calculate_il_at_price(entry_price, t0, t1, max_range, min_range, max_range)
+
+    lower_contracts = abs(min(0, il_lower["IL"]))
+    upper_contracts = abs(min(0, il_upper["IL"]))
+
+    # Compute insurance execution costs for the final contract sizes.
+    lower_exec_ask, lower_spread_cost, lower_slip_cost = apply_execution_costs(
+        mid_price=lower_mid,
+        spread=spread,
+        contracts=lower_contracts,
+        side="buy",
+        slippage_cfg=slippage_cfg,
+    )
+    upper_exec_ask, upper_spread_cost, upper_slip_cost = apply_execution_costs(
+        mid_price=upper_mid,
+        spread=spread,
+        contracts=upper_contracts,
+        side="buy",
+        slippage_cfg=slippage_cfg,
+    )
+
+    lower_cost = lower_contracts * lower_exec_ask
+    upper_cost = upper_contracts * upper_exec_ask
+    total_insurance_cost = lower_cost + upper_cost
+
+    spread_cost_buy = lower_spread_cost + upper_spread_cost
+    slippage_cost_buy = lower_slip_cost + upper_slip_cost
 
     token0_dep, token1_dep = _tokens_for_strategy_human(
         min_range, max_range, deposit_value, entry_price,
@@ -91,16 +131,29 @@ def open_position(
         entry_price, min_range, max_range, amt0_scaled, amt1_scaled, dec0, dec1,
     )
 
+    # "Human-unit" liquidity: the scalar L such that token0 = L*(sqrt(P)-sqrt(Pa))
+    # under this project's USDC/ETH + "price = USD per ETH" convention. Used for
+    # mark-to-market and withdrawal math instead of re-applying a fresh V3 split
+    # to ``deposit_value`` at a different price (which would be wrong).
+    l_human = liquidity_from_tokens(
+        entry_price, token0_dep, token1_dep, min_range, max_range,
+    )
+
     return {
         "open_ts": ts,
         "entry_price": entry_price,
         "min_range": min_range,
         "max_range": max_range,
+        "lower_clob_token_id": lower_clob_token_id,
+        "upper_clob_token_id": upper_clob_token_id,
+        "lower_end_ts": lower_end_ts,
+        "upper_end_ts": upper_end_ts,
         "wallet_before": {"usdc": wallet["usdc"], "eth": wallet["eth"], "value_usd": wallet_value},
         "deposit_value": deposit_value,
         "token0_dep": token0_dep,
         "token1_dep": token1_dep,
         "liquidity": liquidity,
+        "L_human": l_human,
         "dec0": dec0,
         "dec1": dec1,
         "lower_bet_price": insurance_info["lower_bet_price"],
@@ -114,6 +167,7 @@ def open_position(
         "swap_amount": swap_amount_usd,
         "gas_fee_open": gas_open,
         "spread_cost_buy": spread_cost_buy,
+        "slippage_cost_buy": slippage_cost_buy,
         "accumulated_fees_usdc": 0.0,
         "accumulated_fees_eth": 0.0,
         "candle_count": 0,
@@ -130,15 +184,21 @@ def close_position(
     conn=None,
     gas_prices: Optional[Dict[str, int]] = None,
     spread: float = 0.0,
+    slippage_cfg: Optional[SlippageConfig] = None,
+    close_price_override: Optional[float] = None,
+    expired: bool = False,
 ) -> Tuple[Dict, Dict]:
     """Settle a position. Returns (pos, new_wallet)."""
-    if touched_lower:
-        touch_price = pos["min_range"]
-    elif touched_upper:
-        touch_price = pos["max_range"]
+    if close_price_override is not None:
+        touch_price = float(close_price_override)
     else:
-        cp = float(close_candle["close"])
-        touch_price = cp if price_token == 0 else 1.0 / cp
+        if touched_lower:
+            touch_price = pos["min_range"]
+        elif touched_upper:
+            touch_price = pos["max_range"]
+        else:
+            cp = float(close_candle["close"])
+            touch_price = cp if price_token == 0 else 1.0 / cp
 
     il = calculate_il_at_price(
         pos["entry_price"], pos["token0_dep"], pos["token1_dep"],
@@ -149,44 +209,75 @@ def close_position(
 
     payout = 0.0
     insurance_sellback = 0.0
-    if touched_lower:
-        payout += pos["lower_contracts"]
-    if touched_upper:
-        payout += pos["upper_contracts"]
+    if not expired:
+        if touched_lower:
+            payout += pos["lower_contracts"]
+        if touched_upper:
+            payout += pos["upper_contracts"]
 
     get_clob_token_id = _get_db_func("get_clob_token_id")
     get_historical_bet_price = _get_db_func("get_historical_bet_price")
 
     spread_cost_sell = 0.0
+    slippage_cost_sell = 0.0
 
-    if not touched_lower and pos["lower_contracts"] > 0 and conn is not None:
-        lower_clob = get_clob_token_id(token_symbol, pos["min_range"], "down", "Yes", conn)
+    if (not expired) and (not touched_lower) and pos["lower_contracts"] > 0 and conn is not None:
+        lower_clob = pos.get("lower_clob_token_id") or get_clob_token_id(
+            token_symbol, pos["min_range"], "down", "Yes", conn, candle_ts=close_ts
+        )
+        mid_price = None
         if lower_clob:
             mid_price = get_historical_bet_price(lower_clob, close_ts, conn)
-            if mid_price is not None:
-                bid_price = max(mid_price - spread / 2, 0.0)
-                insurance_sellback += pos["lower_contracts"] * bid_price
-                spread_cost_sell += pos["lower_contracts"] * (mid_price - bid_price)
+        if mid_price is None:
+            # Fallback when DB history is missing: use the stored entry-time mid.
+            mid_price = float(pos.get("lower_bet_price", 0.5))
+        bid_exec, sp_cost, sl_cost = apply_execution_costs(
+            mid_price=mid_price,
+            spread=spread,
+            contracts=pos["lower_contracts"],
+            side="sell",
+            slippage_cfg=slippage_cfg,
+        )
+        insurance_sellback += pos["lower_contracts"] * bid_exec
+        spread_cost_sell += sp_cost
+        slippage_cost_sell += sl_cost
 
-    if not touched_upper and pos["upper_contracts"] > 0 and conn is not None:
-        upper_clob = get_clob_token_id(token_symbol, pos["max_range"], "up", "Yes", conn)
+    if (not expired) and (not touched_upper) and pos["upper_contracts"] > 0 and conn is not None:
+        upper_clob = pos.get("upper_clob_token_id") or get_clob_token_id(
+            token_symbol, pos["max_range"], "up", "Yes", conn, candle_ts=close_ts
+        )
+        mid_price = None
         if upper_clob:
             mid_price = get_historical_bet_price(upper_clob, close_ts, conn)
-            if mid_price is not None:
-                bid_price = max(mid_price - spread / 2, 0.0)
-                insurance_sellback += pos["upper_contracts"] * bid_price
-                spread_cost_sell += pos["upper_contracts"] * (mid_price - bid_price)
-
-    if touch_price <= pos["min_range"]:
-        wd_usdc = 0.0
-        wd_eth = pos["deposit_value"] / pos["min_range"] if pos["min_range"] else 0.0
-    elif touch_price >= pos["max_range"]:
-        wd_usdc = pos["deposit_value"]
-        wd_eth = 0.0
-    else:
-        wd_usdc, wd_eth = _tokens_for_strategy_human(
-            pos["min_range"], pos["max_range"], pos["deposit_value"], touch_price,
+        if mid_price is None:
+            # Fallback when DB history is missing: use the stored entry-time mid.
+            mid_price = float(pos.get("upper_bet_price", 0.5))
+        bid_exec, sp_cost, sl_cost = apply_execution_costs(
+            mid_price=mid_price,
+            spread=spread,
+            contracts=pos["upper_contracts"],
+            side="sell",
+            slippage_cfg=slippage_cfg,
         )
+        insurance_sellback += pos["upper_contracts"] * bid_exec
+        spread_cost_sell += sp_cost
+        slippage_cost_sell += sl_cost
+
+    # Withdrawal must come from the position's *liquidity*, not from re-splitting
+    # ``deposit_value`` at ``touch_price`` (which is only correct when
+    # ``touch_price == entry_price``). Fall back to the old approximation if
+    # ``L_human`` was not stored (backwards compatibility with tests that
+    # synthesize positions by hand).
+    l_human = pos.get("L_human")
+    if l_human is None:
+        l_human = liquidity_from_tokens(
+            pos["entry_price"], pos["token0_dep"], pos["token1_dep"],
+            pos["min_range"], pos["max_range"],
+        )
+
+    wd_usdc, wd_eth = tokens_from_liquidity(
+        touch_price, pos["min_range"], pos["max_range"], l_human,
+    )
 
     fees_usdc = pos["accumulated_fees_usdc"]
     fees_eth = pos["accumulated_fees_eth"]
@@ -194,7 +285,8 @@ def close_position(
 
     gas_close = gas_cost_usd(GAS_BURN_COLLECT, close_ts, touch_price, gas_prices or {})
 
-    new_wallet_usdc = wd_usdc + fees_usdc + payout + insurance_sellback - gas_close
+    # External-cost accounting is always ON: gas and insurance are tracked outside the LP wallet.
+    new_wallet_usdc = wd_usdc + fees_usdc
     new_wallet_eth = wd_eth + fees_eth
     new_wallet_value = new_wallet_usdc + new_wallet_eth * touch_price
 
@@ -206,15 +298,24 @@ def close_position(
     pos["wd_eth"] = wd_eth
     pos["il"] = il["IL"]
     pos["il_pct"] = il["IL_pct"]
-    pos["insurance_payout"] = payout
-    pos["insurance_sellback"] = insurance_sellback
-    pos["insurance_net"] = payout + insurance_sellback - pos["insurance_cost"]
+    pos["insurance_payout"] = 0.0 if expired else payout
+    pos["insurance_sellback"] = 0.0 if expired else insurance_sellback
+    pos["insurance_net"] = pos["insurance_payout"] + pos["insurance_sellback"] - pos["insurance_cost"]
     pos["fees_earned_usdc"] = fees_usdc
     pos["fees_earned_eth"] = fees_eth
     pos["fees_earned_usd"] = fees_total_usd
     pos["gas_fee_close"] = gas_close
     pos["spread_cost_sell"] = spread_cost_sell
+    pos["slippage_cost_sell"] = slippage_cost_sell
     pos["wallet_after"] = {"usdc": new_wallet_usdc, "eth": new_wallet_eth, "value_usd": new_wallet_value}
     pos["duration_hours"] = (pos["close_ts"] - pos["open_ts"]) / 3600
+    if expired:
+        pos["close_reason"] = "expiry"
+    elif touched_lower:
+        pos["close_reason"] = "lower"
+    elif touched_upper:
+        pos["close_reason"] = "upper"
+    else:
+        pos["close_reason"] = "period_end"
 
     return pos, {"usdc": new_wallet_usdc, "eth": new_wallet_eth}

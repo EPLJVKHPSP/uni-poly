@@ -1,0 +1,27 @@
+{
+  "backtest": {
+    "pool": "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+    "days": 60,
+    "lookback_days": 0,
+    "initial_eth": 50.0,
+    "initial_usdc": null,
+    "cooldown_hours": 1,
+    "price_token": 0,
+    "fixed_range": null,
+    "sweep": false,
+    "spread": 0.04,
+    "slippage_per_1k_contracts": 0.0,
+    "slippage_max_per_contract": 0.0,
+    "close_policy": "touch",
+    "telemetry": {
+      "enabled": false,
+      "path": null
+    },
+    "output_json": "active_backtest_results.json"
+  },
+  "report": {
+    "input_json": "active_backtest_results.json",
+    "output_html": "report.html",
+    "title": "Hedge of IL in Uniswap Pool (WETH/USDC Pool 0.03%) using Polymarket"
+  }
+}

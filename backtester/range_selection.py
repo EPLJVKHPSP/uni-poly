@@ -29,7 +29,7 @@ def _filter_ranges_for_price(
     combos: List[Dict],
     current_price: float,
     buffer_pct: float = 5.0,
-    max_width_pct: float = 60.0,
+    max_width_pct: float = 80.0,
 ) -> List[Dict]:
     """Keep ranges where price is inside, has adequate buffer, and isn't absurdly wide."""
     out = []
@@ -61,8 +61,10 @@ def _score_range(
     get_clob_token_id = _get_db_func("get_clob_token_id")
     get_historical_bet_price = _get_db_func("get_historical_bet_price")
 
-    lower_clob = get_clob_token_id(token_symbol, mn, "down", "Yes", conn)
-    upper_clob = get_clob_token_id(token_symbol, mx, "up", "Yes", conn)
+    # IMPORTANT: Markets rotate. Always resolve the CLOB token IDs "as-of" candle_ts,
+    # otherwise historical bet price lookups may return None and block re-entry.
+    lower_clob = get_clob_token_id(token_symbol, mn, "down", "Yes", conn, candle_ts=candle_ts)
+    upper_clob = get_clob_token_id(token_symbol, mx, "up", "Yes", conn, candle_ts=candle_ts)
 
     lower_bet = get_historical_bet_price(lower_clob, candle_ts, conn) if lower_clob else None
     upper_bet = get_historical_bet_price(upper_clob, candle_ts, conn) if upper_clob else None
@@ -117,6 +119,16 @@ def pick_best_range(
     if not scored:
         return None
 
+    # Hard cap: don't choose ranges where either side has >10% implied probability.
+    # We interpret Polymarket YES price as the probability proxy.
+    cap = 0.20
+    scored = [
+        s for s in scored
+        if float(s.get("lower_bet_price", 1.0)) <= cap and float(s.get("upper_bet_price", 1.0)) <= cap
+    ]
+    if not scored:
+        return None
+
     max_width = max(s["range_width_pct"] for s in scored) or 1.0
     for s in scored:
         narrowness = 1.0 - (s["range_width_pct"] / max_width)
@@ -133,8 +145,8 @@ def _get_insurance_for_range(
     get_clob_token_id = _get_db_func("get_clob_token_id")
     get_historical_bet_price = _get_db_func("get_historical_bet_price")
 
-    lower_clob = get_clob_token_id(token_symbol, mn, "down", "Yes", conn)
-    upper_clob = get_clob_token_id(token_symbol, mx, "up", "Yes", conn)
+    lower_clob = get_clob_token_id(token_symbol, mn, "down", "Yes", conn, candle_ts=candle_ts)
+    upper_clob = get_clob_token_id(token_symbol, mx, "up", "Yes", conn, candle_ts=candle_ts)
     lower_bet = get_historical_bet_price(lower_clob, candle_ts, conn) if lower_clob else None
     upper_bet = get_historical_bet_price(upper_clob, candle_ts, conn) if upper_clob else None
     if lower_bet is None and upper_bet is None:
@@ -183,6 +195,12 @@ def pick_best_range_by_sweep(
 
     scored: List[Dict] = []
     for idx, (mn, mx) in enumerate(unique):
+        # Enforce the same 10% per-side cap based on Polymarket YES price at candle_ts.
+        ins_now = _get_insurance_for_range(mn, mx, token_symbol, candle_ts, conn)
+        if ins_now is None:
+            continue
+        if float(ins_now.get("lower_bet_price", 1.0)) > 0.20 or float(ins_now.get("upper_bet_price", 1.0)) > 0.20:
+            continue
         try:
             positions, _, _snaps = simulate_fn(
                 lookback_candles, pool_data, token_symbol, investment, conn,

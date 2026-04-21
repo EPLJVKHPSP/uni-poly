@@ -17,14 +17,25 @@ from db_utils import (  # noqa: F401  — kept for patch targets
     get_range_combinations,
     get_clob_token_id,
     get_historical_bet_price,
+    get_candidate_markets,
 )
-from il import calculate_il_at_price  # noqa: F401
+from il import (  # noqa: F401
+    calculate_il_at_price,
+    liquidity_from_tokens,
+    tokens_from_liquidity,
+)
 
 from backtester import (  # noqa: F401
     SUBGRAPH_ID,
     _graph_url,
     fetch_pool_metadata,
     fetch_hourly_candles,
+    validate_candles,
+    validate_gas_coverage,
+    validate_polymarket_coverage,
+    CandleQualityReport,
+    GasCoverageReport,
+    PolymarketCoverageReport,
     _log_base,
     _get_tick_from_price,
     _active_liquidity_for_candle,
@@ -47,6 +58,11 @@ from backtester import (  # noqa: F401
     _get_insurance_for_range,
     open_position,
     close_position,
+    ClosePolicy,
+    SlippageConfig,
+    slippage_per_contract_usd,
+    apply_execution_costs,
+    choose_close_price,
     simulate,
     build_summary,
     run_sweep,

@@ -1,105 +1,171 @@
 # Polymarket-Uniswap V3 Active LP Backtester
 
-Backtesting framework for an active Uniswap V3 LP strategy that uses Polymarket prediction markets as impermanent loss (IL) insurance.
+Backtesting framework for an **active Uniswap V3 LP** strategy that uses **Polymarket prediction markets** as **impermanent loss (IL) insurance**.
 
-## Strategy
+This repo is **configuration-first** (no CLI flags): edit `config.json`, run the backtest, then generate `report.html`.
 
-1. Open a concentrated LP position on Uniswap V3 (USDC/ETH)
-2. Simultaneously buy Polymarket "Yes" contracts on price boundaries as IL insurance
-3. When price touches a boundary: close LP, collect insurance payout, sell back untriggered contracts
-4. Wait 1 hour for price stabilization, then reopen with a dynamically selected range
-5. Repeat — tracking a wallet of USDC + ETH across all cycles
+## Strategy (high level)
+
+1. Open a concentrated LP position on Uniswap V3 (USDC/WETH).
+2. Buy Polymarket “Yes” contracts on the **lower** and **upper** boundaries as insurance.
+3. Close & rebalance when:
+   - price touches a boundary (per `close_policy`), or
+   - the insurance market **expires** (forced close; insurance value becomes 0).
+4. Wait `cooldown_hours`, then open a new position using dynamically selected ranges.
+5. Track wallet evolution (USDC + ETH), pool fees, IL, and insurance cashflows across cycles.
 
 ## Architecture
 
 ```
-active_backtester.py   Main backtester — fetches candles from The Graph, simulates LP + insurance
-├── db_utils.py        PostgreSQL queries for Polymarket range/price data
-└── il.py              Impermanent loss math for Uniswap V3 concentrated liquidity
+active_backtester.py        Backward-compat shim; entrypoint for config-driven runs
 
-parser.py              Syncs Polymarket events into price_events table
-polymarket_history.py  Syncs CLOB price history into bet_price_history table
-docker-compose.yml     PostgreSQL 16 database
+backtester/
+  simulation.py             Core loop (open/close/rebalance, expiry handling, summaries)
+  positions.py              Position lifecycle (LP deposit/withdraw + insurance execution)
+  range_selection.py        Candidate filtering + scoring + Polymarket caps
+  gas.py                    Historical baseFee sampler via Ethereum RPC (daily averages)
+  graph_client.py           The Graph client for Uniswap candles
+
+db_utils.py                 Postgres queries (Polymarket markets, CLOB IDs, price history)
+parser.py                   Sync Polymarket markets into `price_events`
+polymarket_history.py       Sync CLOB price history into `bet_price_history`
+scripts/viz_report.py       Plotly HTML report generator (`report.html`)
+docker-compose.yml          PostgreSQL database
 ```
 
 ## Setup
 
-```bash
-# Start Postgres
-docker-compose up -d
+### 1) Database
 
-# Python environment
-python -m venv venv
+Start Postgres (or point `.env` at an existing instance):
+
+```bash
+docker-compose up -d
+```
+
+Populate Polymarket tables:
+
+```bash
+python3 parser.py
+python3 polymarket_history.py
+```
+
+### 2) Python
+
+```bash
+python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+```
 
-# Configure .env
+### 3) Environment variables (`.env`)
+
+Required:
+
+```bash
 THEGRAPH_API_KEY=<your-key>
+DB_HOST=localhost
+DB_PORT=5432
 DB_NAME=polymarket
 DB_USER=polymarket
 DB_PASSWORD=polymarket_pw
-DB_HOST=localhost
-DB_PORT=5432
-
-# Populate database
-python parser.py
-python polymarket_history.py
 ```
 
-## Usage
-
-### Dynamic range selection (recommended)
-```bash
-python active_backtester.py --days 90 --investment 100000
-```
-
-### Fixed range
-```bash
-python active_backtester.py --days 90 --investment 100000 --fixed-range "1800,3400"
-```
-
-### Sweep all Polymarket ranges
-```bash
-python active_backtester.py --days 90 --investment 100000 --sweep
-```
-
-### Interactive HTML report (Plotly)
-1) Run a backtest to generate `active_backtest_results.json`:
+Recommended (for reliable gas sampling; prevents “gas fees = 0” when RPC is rate-limited):
 
 ```bash
-python active_backtester.py --days 90 --investment 100000
+ETH_RPC_URL=https://ethereum.publicnode.com
 ```
 
-2) Generate the HTML report:
+## Running a backtest
+
+### 1) Configure `config.json`
+
+The backtester uses an **ETH-first** capital model:
+
+- `backtest.initial_eth`: your principal in ETH (X)
+- `backtest.initial_usdc`: optional override for required USDC (Y). If `null`, it is computed to match the chosen entry range.
+
+Other key knobs:
+
+- `backtest.days`: backtest window length
+- `backtest.lookback_days`: `0` = heuristic range selection; `>0` enables lookback sweep selection
+- `backtest.cooldown_hours`: skip this many 1h candles after each close
+- `backtest.spread`, `backtest.slippage_*`: Polymarket execution model
+- `backtest.close_policy`: `touch` | `next_candle` | `pessimistic`
+
+### 2) Run the backtest (writes JSON)
 
 ```bash
-python scripts/viz_report.py --input active_backtest_results.json --output report.html
+python3 active_backtester.py
 ```
 
-### CLI flags
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--pool` | USDC/WETH 0.05% | Uniswap V3 pool address |
-| `--days` | 90 | Backtest window in days |
-| `--investment` | 100000 | Initial investment in USD |
-| `--cooldown` | 1 | Hours to wait after closing before reopening |
-| `--price-token` | 0 | Which token is the price base (0 or 1) |
-| `--fixed-range` | None | Force a specific range, e.g. `"2000,2400"` |
-| `--sweep` | False | Sweep all Polymarket ranges and rank by APY |
-| `--spread` | 0.04 | Polymarket bid-ask spread estimate in $/contract |
-| `--output` | `active_backtest_results.json` | Output JSON path |
+Outputs:
 
-## Output
+- `active_backtest_results.json`: best-run summary + snapshots + position ledger
+- (if `backtest.sweep=true`) `active_backtest_results_sweep.json`: ranked sweep table
 
-Results are saved as JSON with per-position details including:
-- Wallet state before/after each position (USDC + ETH quantities)
-- Fees earned (split into USDC and ETH, in-kind)
-- IL suffered
-- Insurance cost, payout, sellback (untriggered contracts sold at market)
-- Gas fees per open/close (historical baseFeePerGas sampled from Ethereum blocks via free RPC)
-- Spread cost per buy/sell (configurable via `--spread`)
-- Token quantity deltas vs initial deposit
+### 3) Generate the HTML report (Plotly)
 
-## Known Limitations
+```bash
+python3 scripts/viz_report.py
+```
 
-**Polymarket bid-ask spread is estimated, not historical.** The `--spread` flag (default $0.04/contract) models the cost of buying at the ask and selling at the bid. The Polymarket CLOB API only exposes live orderbook data (`GET /book`, `GET /spread`) — there is no historical bid-ask endpoint, and the undocumented `/orderbook-history` endpoint has been non-functional since February 2026. Historical spread data cannot be retrieved retroactively, so the backtester uses a flat configurable estimate. Typical real spreads range from $0.03-$0.10 depending on market liquidity. Set `--spread 0` to disable.
+This writes `report.html` (self-contained HTML + Plotly CDN JS).
+
+## What you’ll see in `report.html` (example output)
+
+The report is built from `active_backtest_results.json` and includes:
+
+### Balances + Cashflow
+
+A compact summary table (EXEC vs MID) with:
+
+- **Initial LP deposit**: ETH + USDC quantities at first entry (and USD notional)
+- **HODL repriced at end**: same initial quantities repriced at the final ETH price
+- **Final LP wallet** after closing the last position: ETH + USDC quantities (and USD notional)
+- **Cashflows**:
+  - gas spent (USD)
+  - Polymarket deposited (insurance buy cost)
+  - Polymarket payout
+  - Polymarket sellback (incl. last position)
+  - Uniswap fees earned (USD)
+- **Combined**: cost basis vs final total value, ROI/APY (EXEC vs MID)
+
+### Strategy Ranges Over Time
+
+One chart showing:
+
+- pool price (ETH/USD)
+- the active LP range overlay (upper/lower bands)
+- open/close markers (rebalance points)
+- legend directly under the chart
+
+### Rebalance History (EXEC / with premium)
+
+A per-position ledger showing, for each cycle:
+
+- open/close date, close reason
+- entry/close prices and chosen range
+- insurance: buy (EXEC), payout, sell (EXEC)
+- fees (USD), IL (USDC), and Δ wallet value (USD)
+
+### Rebalance History (MID / no premium)
+
+Same layout as above, but insurance buy/sell reconstructed at MID prices by removing execution drag (spread/slippage).
+
+## Tests
+
+```bash
+make test
+```
+
+## Known limitations / modeling notes
+
+- **Polymarket execution is sensitivity-based, not depth-truthy.**
+  Historical orderbook depth is not reliably available, so execution is modeled via:
+  - flat spread (`backtest.spread`)
+  - optional size-aware slippage (`backtest.slippage_*`)
+- **Gas is sampled** from daily average `baseFeePerGas` using an Ethereum RPC. If the RPC is rate-limited/unavailable, gas falls back to $0 for missing days (use `ETH_RPC_URL`).
+
+For a deeper discussion of “truth blockers” and design constraints, see `docs/truth_blockers_and_plan.md`.

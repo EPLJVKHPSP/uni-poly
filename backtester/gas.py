@@ -1,6 +1,7 @@
 """Historical gas prices via free public Ethereum RPC and gas cost helpers."""
 
 import logging
+import os
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Dict
@@ -13,22 +14,31 @@ GAS_MINT = 430_000
 GAS_BURN_COLLECT = 250_000
 GAS_SWAP = 150_000
 
-_DEFAULT_RPC = "https://eth.llamarpc.com"
+_DEFAULT_RPC = os.getenv("ETH_RPC_URL", "https://ethereum.publicnode.com")
 _BLOCK_TIME_SECS = 12
 _SAMPLES_PER_DAY = 4
 
 
 def _rpc_call(method: str, params: list, rpc_url: str = _DEFAULT_RPC) -> dict:
-    resp = _requests_mod.post(
-        rpc_url,
-        json={"jsonrpc": "2.0", "method": method, "params": params, "id": 1},
-        timeout=15,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if "error" in data:
-        raise RuntimeError(data["error"])
-    return data.get("result", {})
+    payload = {"jsonrpc": "2.0", "method": method, "params": params, "id": 1}
+    last_exc: Exception = RuntimeError("RPC call failed")
+    for attempt in range(5):
+        try:
+            resp = _requests_mod.post(rpc_url, json=payload, timeout=15)
+            if resp.status_code in (429, 500, 502, 503, 504):
+                # brief exponential backoff for overloaded public RPCs
+                time.sleep(0.3 * (2 ** attempt))
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            if "error" in data:
+                raise RuntimeError(data["error"])
+            return data.get("result", {})
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(0.2 * (2 ** attempt))
+            continue
+    raise last_exc
 
 
 def fetch_daily_gas_prices(start_date: str, end_date: str) -> Dict[str, int]:

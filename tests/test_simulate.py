@@ -79,10 +79,10 @@ class TestOpenPosition:
 
     @pytest.mark.integration
     def test_deposit_plus_costs_equals_wallet(self, sample_candle, pool_data, sample_wallet, sample_insurance_info):
-        """deposit_value + insurance_cost + swap_fee + gas_fee_open must equal the total wallet value."""
+        """LP deposit only reflects swap fee (insurance/gas are external)."""
         pos = open_position(sample_candle, pool_data, 2500.0, 3500.0, sample_wallet, sample_insurance_info)
         wallet_value = sample_wallet["usdc"] + sample_wallet["eth"] * pos["entry_price"]
-        assert pos["deposit_value"] + pos["insurance_cost"] + pos["swap_fee"] + pos["gas_fee_open"] == pytest.approx(wallet_value, rel=1e-6)
+        assert pos["deposit_value"] + pos["swap_fee"] == pytest.approx(wallet_value, rel=1e-6)
 
     @pytest.mark.integration
     def test_liquidity_round_trip_recovers_deposit(self, sample_candle, pool_data, sample_wallet, sample_insurance_info):
@@ -164,7 +164,7 @@ class TestSwapFee:
         pos = open_position(sample_candle, pool_no_fee, 2500.0, 3500.0, sample_wallet, sample_insurance_info)
         assert pos["swap_fee"] == 0.0
         wallet_value = sample_wallet["usdc"] + sample_wallet["eth"] * pos["entry_price"]
-        assert pos["deposit_value"] + pos["insurance_cost"] == pytest.approx(wallet_value, rel=1e-6)
+        assert pos["deposit_value"] == pytest.approx(wallet_value, rel=1e-6)
 
     @pytest.mark.integration
     def test_swap_fee_proportional_to_swap_amount(self, sample_candle, pool_data, sample_insurance_info):
@@ -212,13 +212,13 @@ class TestGasFee:
 
     @pytest.mark.integration
     def test_gas_fee_reduces_deposit(self, sample_candle, pool_data, sample_wallet, sample_insurance_info):
-        """Deposit value with gas must be less than without."""
+        """Gas is external: deposit value should be unchanged by gas_prices."""
         pos_no_gas = open_position(sample_candle, pool_data, 2500.0, 3500.0, sample_wallet, sample_insurance_info)
         pos_with_gas = open_position(
             sample_candle, pool_data, 2500.0, 3500.0, sample_wallet, sample_insurance_info,
             gas_prices=self.SAMPLE_GAS_PRICES,
         )
-        assert pos_with_gas["deposit_value"] < pos_no_gas["deposit_value"]
+        assert pos_with_gas["deposit_value"] == pytest.approx(pos_no_gas["deposit_value"], rel=1e-12)
         assert pos_with_gas["gas_fee_open"] > 0
         assert pos_no_gas["gas_fee_open"] == 0.0
 
@@ -236,7 +236,7 @@ class TestGasFee:
 
     @pytest.mark.integration
     def test_gas_fee_close_deducted_from_wallet(self, sample_candle, pool_data, sample_wallet, sample_insurance_info):
-        """Gas fee on close should reduce the returned wallet USDC."""
+        """Gas is external: close gas should not change returned LP wallet."""
         pos = open_position(sample_candle, pool_data, 2500.0, 3500.0, sample_wallet, sample_insurance_info)
 
         candle_close = {"periodStartUnix": "1700086400", "close": "3000.0"}
@@ -247,18 +247,54 @@ class TestGasFee:
             pos2, candle_close, False, False,
             gas_prices=self.SAMPLE_GAS_PRICES,
         )
-        assert wallet_with_gas["usdc"] < wallet_no_gas["usdc"]
+        assert wallet_with_gas["usdc"] == pytest.approx(wallet_no_gas["usdc"], rel=1e-12)
 
     @pytest.mark.integration
     def test_value_conservation_with_gas(self, sample_candle, pool_data, sample_wallet, sample_insurance_info):
-        """deposit + insurance + swap_fee + gas_fee_open == wallet_value even with gas."""
+        """Deposit + swap_fee == wallet_value even with gas (insurance/gas external)."""
         pos = open_position(
             sample_candle, pool_data, 2500.0, 3500.0, sample_wallet, sample_insurance_info,
             gas_prices=self.SAMPLE_GAS_PRICES,
         )
         wallet_value = sample_wallet["usdc"] + sample_wallet["eth"] * pos["entry_price"]
-        total_costs = pos["deposit_value"] + pos["insurance_cost"] + pos["swap_fee"] + pos["gas_fee_open"]
-        assert total_costs == pytest.approx(wallet_value, rel=1e-6)
+        assert pos["deposit_value"] + pos["swap_fee"] == pytest.approx(wallet_value, rel=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# External-cost accounting mode
+# ---------------------------------------------------------------------------
+
+class TestExternalCostsAccounting:
+
+    @pytest.mark.integration
+    def test_open_position_external_costs_deposit_equals_wallet_value_when_no_swap_fee(
+        self, sample_candle, sample_wallet, sample_insurance_info
+    ):
+        """LP deposit is not reduced by insurance or gas (only swap_fee)."""
+        pool_no_fee = {
+            "id": "0xpool", "feeTier": "0",
+            "token0": {"id": "0xa", "symbol": "USDC", "name": "USDC", "decimals": "6"},
+            "token1": {"id": "0xb", "symbol": "WETH", "name": "WETH", "decimals": "18"},
+        }
+        pos = open_position(sample_candle, pool_no_fee, 2500.0, 3500.0, sample_wallet, sample_insurance_info)
+        wallet_value = sample_wallet["usdc"] + sample_wallet["eth"] * pos["entry_price"]
+        assert pos["swap_fee"] == 0.0
+        assert pos["deposit_value"] == pytest.approx(wallet_value, rel=1e-9)
+        assert pos["insurance_cost"] > 0
+
+    @pytest.mark.integration
+    def test_close_position_external_costs_wallet_excludes_insurance_and_gas(
+        self, sample_candle, sample_wallet, sample_insurance_info
+    ):
+        pool_no_fee = {
+            "id": "0xpool", "feeTier": "0",
+            "token0": {"id": "0xa", "symbol": "USDC", "name": "USDC", "decimals": "6"},
+            "token1": {"id": "0xb", "symbol": "WETH", "name": "WETH", "decimals": "18"},
+        }
+        pos = open_position(sample_candle, pool_no_fee, 2500.0, 3500.0, sample_wallet, sample_insurance_info)
+        closed, new_wallet = close_position(pos, sample_candle, False, False)
+        assert new_wallet["usdc"] == pytest.approx(closed["wd_usdc"] + closed["fees_earned_usdc"], rel=1e-9)
+        assert new_wallet["eth"] == pytest.approx(closed["wd_eth"] + closed["fees_earned_eth"], rel=1e-9)
 
 
 # ---------------------------------------------------------------------------
@@ -286,10 +322,10 @@ class TestSpread:
 
     @pytest.mark.integration
     def test_spread_reduces_deposit(self, sample_candle, pool_data, sample_wallet, sample_insurance_info):
-        """Higher insurance cost from spread reduces the deposit value."""
+        """Spread affects insurance execution, not LP deposit (insurance external)."""
         pos_no = open_position(sample_candle, pool_data, 2500.0, 3500.0, sample_wallet, sample_insurance_info, spread=0.0)
         pos_sp = open_position(sample_candle, pool_data, 2500.0, 3500.0, sample_wallet, sample_insurance_info, spread=0.04)
-        assert pos_sp["deposit_value"] < pos_no["deposit_value"]
+        assert pos_sp["deposit_value"] == pytest.approx(pos_no["deposit_value"], rel=1e-12)
 
     @pytest.mark.integration
     def test_spread_buy_capped_at_one(self, sample_candle, pool_data, sample_wallet):
@@ -360,14 +396,13 @@ class TestSpread:
 
     @pytest.mark.integration
     def test_value_conservation_with_spread(self, sample_candle, pool_data, sample_wallet, sample_insurance_info):
-        """deposit + insurance + swap_fee + gas == wallet_value must still hold with spread."""
+        """Deposit + swap_fee == wallet_value must still hold with spread (insurance/gas external)."""
         pos = open_position(
             sample_candle, pool_data, 2500.0, 3500.0, sample_wallet, sample_insurance_info,
             spread=0.04,
         )
         wallet_value = sample_wallet["usdc"] + sample_wallet["eth"] * pos["entry_price"]
-        total = pos["deposit_value"] + pos["insurance_cost"] + pos["swap_fee"] + pos["gas_fee_open"]
-        assert total == pytest.approx(wallet_value, rel=1e-6)
+        assert pos["deposit_value"] + pos["swap_fee"] == pytest.approx(wallet_value, rel=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +464,7 @@ class TestRebalanceCycleQuantities:
             assert actual_ratio == pytest.approx(expected_ratio, rel=1e-6)
 
             new_wallet_value = new_wallet["usdc"] + new_wallet["eth"] * pos_2["entry_price"]
-            assert pos_2["deposit_value"] + pos_2["insurance_cost"] + pos_2["swap_fee"] + pos_2["gas_fee_open"] == pytest.approx(new_wallet_value, rel=1e-6)
+            assert pos_2["deposit_value"] + pos_2["swap_fee"] == pytest.approx(new_wallet_value, rel=1e-6)
 
     @pytest.mark.integration
     @patch("active_backtester.get_historical_bet_price")
@@ -447,6 +482,7 @@ class TestRebalanceCycleQuantities:
         positions, wallet, snaps = simulate(
             candles, pool_data, "ETH", 100_000.0, conn,
             fixed_range=(2500.0, 3500.0), quiet=True,
+            initial_eth=16.666667,
         )
 
         for i, pos in enumerate(positions):
@@ -548,6 +584,68 @@ class TestClosePosition:
         assert wallet["eth"] > 0
 
 
+class TestClosePositionWithdrawalMath:
+    """Regression guards for the LP withdrawal math fix.
+
+    Before the fix, ``close_position`` computed boundary withdrawals as
+    ``deposit_value / min_range`` (lower touch) or ``deposit_value`` in USDC
+    (upper touch). Those values diverge from the actual LP composition unless
+    ``touch_price == entry_price``. The fix uses the position's human-unit
+    liquidity to derive the correct composition, so wallet + fees + insurance
+    exactly reconciles with ``il.calculate_il_at_price``'s ``LP_value``.
+    """
+
+    @pytest.mark.unit
+    def test_lp_withdrawal_matches_il_lp_value_at_lower_boundary(self, sample_candle, pool_data, sample_insurance_info):
+        from active_backtester import open_position, close_position, calculate_il_at_price
+        wallet = {"usdc": 50_000.0, "eth": 16.666667}
+        pos = open_position(sample_candle, pool_data, 2500.0, 3500.0, wallet, sample_insurance_info)
+        assert pos is not None
+
+        candle_close = {"periodStartUnix": "1700086400", "close": "2500.0"}
+        closed, new_wallet = close_position(pos, candle_close, touched_lower=True, touched_upper=False)
+
+        il = calculate_il_at_price(
+            pos["entry_price"], pos["token0_dep"], pos["token1_dep"],
+            2500.0, 2500.0, 3500.0,
+        )
+        withdrawn_value = closed["wd_usdc"] + closed["wd_eth"] * 2500.0
+        assert withdrawn_value == pytest.approx(il["LP_value"], rel=1e-6)
+
+    @pytest.mark.unit
+    def test_lp_withdrawal_matches_il_lp_value_at_upper_boundary(self, sample_candle, pool_data, sample_insurance_info):
+        from active_backtester import open_position, close_position, calculate_il_at_price
+        wallet = {"usdc": 50_000.0, "eth": 16.666667}
+        pos = open_position(sample_candle, pool_data, 2500.0, 3500.0, wallet, sample_insurance_info)
+
+        candle_close = {"periodStartUnix": "1700086400", "close": "3500.0"}
+        closed, new_wallet = close_position(pos, candle_close, touched_lower=False, touched_upper=True)
+
+        il = calculate_il_at_price(
+            pos["entry_price"], pos["token0_dep"], pos["token1_dep"],
+            3500.0, 2500.0, 3500.0,
+        )
+        withdrawn_value = closed["wd_usdc"] + closed["wd_eth"] * 3500.0
+        assert withdrawn_value == pytest.approx(il["LP_value"], rel=1e-6)
+
+    @pytest.mark.unit
+    def test_lp_withdrawal_matches_il_lp_value_in_range(self, sample_candle, pool_data, sample_insurance_info):
+        """Mid-range close: withdrawal value must match ``LP_value`` from il.py."""
+        from active_backtester import open_position, close_position, calculate_il_at_price
+        wallet = {"usdc": 50_000.0, "eth": 16.666667}
+        pos = open_position(sample_candle, pool_data, 2500.0, 3500.0, wallet, sample_insurance_info)
+
+        candle_close = {"periodStartUnix": "1700086400", "close": "3200.0"}
+        closed, _ = close_position(pos, candle_close, touched_lower=False, touched_upper=False)
+
+        il = calculate_il_at_price(
+            pos["entry_price"], pos["token0_dep"], pos["token1_dep"],
+            3200.0, 2500.0, 3500.0,
+        )
+        withdrawn_value = closed["wd_usdc"] + closed["wd_eth"] * 3200.0
+        assert withdrawn_value == pytest.approx(il["LP_value"], rel=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # _score_range / pick_best_range
 # ---------------------------------------------------------------------------
@@ -606,7 +704,24 @@ class TestPickBestRange:
         conn = MagicMock()
         result = pick_best_range(sample_combos, 3000.0, "ETH", 1700000000, 100000, conn)
         assert result is not None
-        assert "score" in result
+        assert result["min"] == 2600
+        assert result["max"] == 3400
+        assert float(result["lower_bet_price"]) <= 0.20
+        assert float(result["upper_bet_price"]) <= 0.20
+
+    @pytest.mark.integration
+    @patch("active_backtester._score_range")
+    def test_filters_out_ranges_with_high_bet_prob(self, mock_score, sample_combos):
+        mock_score.side_effect = [
+            {"min": 2400, "max": 3600, "lower_bet_price": 0.05, "upper_bet_price": 0.21, "insurance_cost_rate": 0.16, "range_width_pct": 40.0},
+            {"min": 2600, "max": 3400, "lower_bet_price": 0.20, "upper_bet_price": 0.20, "insurance_cost_rate": 0.20, "range_width_pct": 26.67},
+            {"min": 2800, "max": 3200, "lower_bet_price": 0.22, "upper_bet_price": 0.09, "insurance_cost_rate": 0.21, "range_width_pct": 13.33},
+        ]
+        conn = MagicMock()
+        result = pick_best_range(sample_combos, 3000.0, "ETH", 1700000000, 100000, conn)
+        assert result is not None
+        assert float(result["lower_bet_price"]) <= 0.20
+        assert float(result["upper_bet_price"]) <= 0.20
 
     @pytest.mark.integration
     @patch("active_backtester._score_range")
@@ -668,6 +783,7 @@ class TestSnapshots:
         _, _, snaps = simulate(
             candles, pool_data, "ETH", 100_000.0, conn,
             fixed_range=(2500.0, 3500.0), quiet=True,
+            initial_eth=16.666667,
         )
         assert len(snaps) == len(candles)
 
@@ -683,6 +799,7 @@ class TestSnapshots:
         _, _, snaps = simulate(
             candles, pool_data, "ETH", 100_000.0, conn,
             fixed_range=(2500.0, 3500.0), quiet=True,
+            initial_eth=16.666667,
         )
         required = {"ts", "price", "hodl_usd", "strategy_usd", "lp_value_usd",
                      "fees_accrued_usd", "poly_equity_usd", "wallet_usdc",
@@ -703,9 +820,12 @@ class TestSnapshots:
         _, _, snaps = simulate(
             candles, pool_data, "ETH", 100_000.0, conn,
             fixed_range=(2500.0, 3500.0), quiet=True,
+            initial_eth=16.666667,
         )
         first = snaps[0]
-        expected_hodl = 50_000.0 + (50_000.0 / 3000.0) * first["price"]
+        # ETH-first mode: baseline quantities depend on the computed USDC requirement.
+        # Assert internal consistency using snapshot wallet quantities.
+        expected_hodl = first["wallet_usdc"] + first["wallet_eth"] * first["price"]
         assert first["hodl_usd"] == pytest.approx(expected_hodl, rel=1e-4)
 
     @pytest.mark.integration
@@ -721,6 +841,7 @@ class TestSnapshots:
         _, _, snaps = simulate(
             candles, pool_data, "ETH", 100_000.0, conn,
             fixed_range=(2500.0, 3500.0), quiet=True,
+            initial_eth=16.666667,
         )
         open_snaps = [s for s in snaps if s["position_open"]]
         assert len(open_snaps) > 0
@@ -738,6 +859,7 @@ class TestSnapshots:
         _, _, snaps = simulate(
             candles, pool_data, "ETH", 100_000.0, conn,
             fixed_range=(2500.0, 3500.0), quiet=True,
+            initial_eth=16.666667,
         )
         open_snaps = [s for s in snaps if s["position_open"]]
         for s in open_snaps:
@@ -755,6 +877,7 @@ class TestSnapshots:
         _, _, snaps = simulate(
             candles, pool_data, "ETH", 100_000.0, conn,
             fixed_range=(2500.0, 3500.0), quiet=True,
+            initial_eth=16.666667,
         )
         for s in snaps:
             if s["position_open"]:
@@ -777,10 +900,90 @@ class TestSnapshots:
         positions, wallet, snaps = simulate(
             candles, pool_data, "ETH", 100_000.0, conn,
             fixed_range=(2500.0, 3500.0), quiet=True,
+            initial_eth=16.666667,
         )
         summary = build_summary(positions, candles, 100_000.0, "0xpool", "ETH", wallet, snapshots=snaps)
         assert "snapshots" in summary
         assert len(summary["snapshots"]) == len(snaps)
+
+
+class TestSummaryBaselinesAndQuality:
+    """The summary must carry the baselines block and data_quality block so
+    the operator can answer 'does it beat HODL after costs?' and judge how
+    much to trust the answer, without re-running anything."""
+
+    @pytest.mark.integration
+    @patch("active_backtester.get_historical_bet_price")
+    @patch("active_backtester.get_clob_token_id")
+    def test_summary_has_baselines_block(self, mock_clob, mock_bet_price, pool_data):
+        mock_clob.return_value = "0xclob"
+        mock_bet_price.return_value = 0.15
+
+        from active_backtester import build_summary
+        candles = make_candle_series(n=100, start_price=3000.0, price_delta=0.0)
+        conn = MagicMock()
+        positions, wallet, snaps = simulate(
+            candles, pool_data, "ETH", 100_000.0, conn,
+            fixed_range=(2500.0, 3500.0), quiet=True,
+            initial_eth=16.666667,
+        )
+        summary = build_summary(positions, candles, 100_000.0, "0xpool", "ETH", wallet, snapshots=snaps)
+        assert "baselines" in summary
+        assert "hodl" in summary["baselines"]
+        assert "unhedged_active_lp" in summary["baselines"]
+        hodl = summary["baselines"]["hodl"]
+        assert set(hodl).issuperset({"final_value_usd", "roi_pct",
+                                      "outperformance_vs_hodl_usd",
+                                      "outperformance_vs_hodl_pct"})
+        unhedged = summary["baselines"]["unhedged_active_lp"]
+        assert set(unhedged).issuperset({"final_value_usd", "roi_pct", "apy",
+                                          "hedge_net_contribution_usd"})
+
+    @pytest.mark.integration
+    @patch("active_backtester.get_historical_bet_price")
+    @patch("active_backtester.get_clob_token_id")
+    def test_hedge_net_contribution_reconciles(self, mock_clob, mock_bet_price, pool_data):
+        """``unhedged.final_value + hedge_net_contribution == strategy final_value``."""
+        mock_clob.return_value = "0xclob"
+        mock_bet_price.return_value = 0.15
+
+        from active_backtester import build_summary
+        candles = make_candle_series(n=100, start_price=3000.0, price_delta=0.0)
+        candles[30]["low"] = "2400.0"  # force a lower-boundary touch
+        conn = MagicMock()
+        positions, wallet, snaps = simulate(
+            candles, pool_data, "ETH", 100_000.0, conn,
+            fixed_range=(2500.0, 3500.0), quiet=True,
+            initial_eth=16.666667,
+        )
+        summary = build_summary(positions, candles, 100_000.0, "0xpool", "ETH", wallet, snapshots=snaps)
+        total = summary["active_strategy"]["final_value_usd"]
+        unh = summary["baselines"]["unhedged_active_lp"]
+        assert unh["final_value_usd"] + unh["hedge_net_contribution_usd"] == pytest.approx(total, rel=1e-2)
+
+    @pytest.mark.integration
+    @patch("active_backtester.get_historical_bet_price")
+    @patch("active_backtester.get_clob_token_id")
+    def test_data_quality_block_passthrough(self, mock_clob, mock_bet_price, pool_data):
+        mock_clob.return_value = "0xclob"
+        mock_bet_price.return_value = 0.15
+
+        from active_backtester import build_summary
+        candles = make_candle_series(n=20, start_price=3000.0, price_delta=0.0)
+        conn = MagicMock()
+        positions, wallet, snaps = simulate(
+            candles, pool_data, "ETH", 100_000.0, conn,
+            fixed_range=(2500.0, 3500.0), quiet=True,
+            initial_eth=16.666667,
+        )
+        dq = {"candles": {"candle_count": 20}, "gas": {}, "polymarket": {}}
+        run_meta = {"pool_id": "0xpool", "days": 1}
+        summary = build_summary(
+            positions, candles, 100_000.0, "0xpool", "ETH", wallet,
+            snapshots=snaps, data_quality=dq, run_metadata=run_meta,
+        )
+        assert summary["data_quality"] == dq
+        assert summary["run_metadata"] == run_meta
 
 
 # ---------------------------------------------------------------------------
@@ -804,6 +1007,7 @@ class TestSimulate:
         positions, wallet, snaps = simulate(
             candles, pool_data, "ETH", 100000.0, conn,
             fixed_range=(2500.0, 3500.0), quiet=True,
+            initial_eth=16.666667,
         )
 
         assert len(positions) >= 1
@@ -822,6 +1026,7 @@ class TestSimulate:
         positions, wallet, snaps = simulate(
             candles, pool_data, "ETH", 100000.0, conn,
             fixed_range=(2500.0, 3500.0), quiet=True,
+            initial_eth=16.666667,
         )
 
         assert len(positions) == 0
@@ -839,6 +1044,7 @@ class TestSimulate:
         positions, wallet, snaps = simulate(
             candles, pool_data, "ETH", 100000.0, conn,
             fixed_range=(2500.0, 3500.0), quiet=True,
+            initial_eth=16.666667,
         )
 
         if positions:
@@ -860,11 +1066,121 @@ class TestSimulate:
         positions, _, snaps = simulate(
             candles, pool_data, "ETH", 100000.0, conn,
             fixed_range=(2500.0, 3500.0), cooldown_hours=3, quiet=True,
+            initial_eth=16.666667,
         )
 
         if len(positions) >= 2:
             gap = positions[1]["open_ts"] - positions[0]["close_ts"]
             assert gap >= 3600 * 3
+
+
+class TestClosePoliciesIntegration:
+    """Integration guards: close policy changes results deterministically."""
+
+    @pytest.mark.integration
+    @patch("active_backtester.get_historical_bet_price")
+    @patch("active_backtester.get_clob_token_id")
+    def test_next_candle_close_changes_close_price(self, mock_clob, mock_bet_price, pool_data):
+        mock_clob.return_value = "0xclob"
+        mock_bet_price.return_value = 0.15
+
+        candles = make_candle_series(n=10, start_price=3000.0, price_delta=0.0)
+        # Touch lower at candle 5, but have the *next* candle close far away.
+        candles[5]["low"] = "2400.0"
+        candles[6]["close"] = "3100.0"
+
+        conn = MagicMock()
+        pos_touch, _, _ = simulate(
+            candles, pool_data, "ETH", 100_000.0, conn,
+            fixed_range=(2500.0, 3500.0), quiet=True, close_policy="touch",
+            initial_eth=16.666667,
+        )
+        pos_next, _, _ = simulate(
+            candles, pool_data, "ETH", 100_000.0, conn,
+            fixed_range=(2500.0, 3500.0), quiet=True, close_policy="next_candle",
+            initial_eth=16.666667,
+        )
+
+        assert pos_touch, "touch policy should produce at least one position"
+        assert pos_next, "next_candle policy should produce at least one position"
+        assert pos_touch[0]["close_price"] == pytest.approx(2500.0)
+        assert pos_next[0]["close_price"] == pytest.approx(3100.0)
+
+    @pytest.mark.integration
+    @patch("active_backtester.get_historical_bet_price")
+    @patch("active_backtester.get_clob_token_id")
+    def test_pessimistic_is_worse_than_touch_on_lower(self, mock_clob, mock_bet_price, pool_data):
+        mock_clob.return_value = "0xclob"
+        mock_bet_price.return_value = 0.15
+
+        candles = make_candle_series(n=10, start_price=3000.0, price_delta=0.0)
+        candles[5]["low"] = "2400.0"
+        candles[5]["close"] = "2400.0"  # worse than boundary
+
+        conn = MagicMock()
+        pos_touch, _, _ = simulate(
+            candles, pool_data, "ETH", 100_000.0, conn,
+            fixed_range=(2500.0, 3500.0), quiet=True, close_policy="touch",
+            initial_eth=16.666667,
+        )
+        pos_pess, _, _ = simulate(
+            candles, pool_data, "ETH", 100_000.0, conn,
+            fixed_range=(2500.0, 3500.0), quiet=True, close_policy="pessimistic",
+            initial_eth=16.666667,
+        )
+
+        assert pos_touch and pos_pess
+        assert pos_touch[0]["close_price"] == pytest.approx(2500.0)
+        assert pos_pess[0]["close_price"] == pytest.approx(2400.0)
+
+
+class TestSummaryNewFields:
+    @pytest.mark.integration
+    @patch("active_backtester.get_historical_bet_price")
+    @patch("active_backtester.get_clob_token_id")
+    def test_summary_includes_slippage_and_delta_matched_baseline(self, mock_clob, mock_bet_price, pool_data):
+        mock_clob.return_value = "0xclob"
+        mock_bet_price.return_value = 0.15
+
+        from active_backtester import build_summary
+        candles = make_candle_series(n=50, start_price=3000.0, price_delta=0.0)
+        candles[10]["low"] = "2400.0"
+
+        conn = MagicMock()
+        positions, wallet, snaps = simulate(
+            candles, pool_data, "ETH", 100_000.0, conn,
+            fixed_range=(2500.0, 3500.0), quiet=True,
+            slippage_per_1k_contracts=0.02,
+            slippage_max_per_contract=0.05,
+            initial_eth=16.666667,
+        )
+        summary = build_summary(positions, candles, 100_000.0, "0xpool", "ETH", wallet, snapshots=snaps)
+        s = summary["active_strategy"]
+        assert "total_slippage_cost_usdc" in s
+        assert s["total_slippage_cost_usdc"] >= 0
+
+        bl = summary.get("baselines", {})
+        assert "delta_matched_hodl" in bl
+        assert "final_value_usd" in bl["delta_matched_hodl"]
+
+        edge = summary.get("edge_lp_plus_hedge", {})
+        assert set(edge).issuperset({"usd", "pct"}) or edge == {}
+
+        # New: explicit Polymarket execution counterfactual block (mid vs actual).
+        pmx = summary.get("polymarket_execution", {})
+        assert "mid_price_counterfactual" in pmx
+        assert "actual" in pmx
+        mid = pmx["mid_price_counterfactual"]
+        actual = pmx["actual"]
+        assert set(mid).issuperset({"insurance_buy_cost_usd", "exec_drag_total_usd"})
+        assert set(actual).issuperset({"insurance_buy_cost_usd"})
+        # Identity: actual_buy ~= mid_buy + exec_premium_buy
+        assert actual["insurance_buy_cost_usd"] == pytest.approx(
+            mid["insurance_buy_cost_usd"] + mid["exec_premium_buy_usd"], rel=1e-6
+        )
+
+        cf = summary.get("counterfactuals", {}).get("db_mid_execution", {})
+        assert set(cf).issuperset({"final_value_usd", "roi_pct", "apy", "delta_vs_actual"})
 
 
 # ---------------------------------------------------------------------------
@@ -895,7 +1211,7 @@ class TestRunSweep:
         candles = make_candle_series(n=720, start_price=3000.0, price_delta=0.0)
         conn = MagicMock()
 
-        results = run_sweep(candles, pool_data, "ETH", 100000.0, conn)
+        results = run_sweep(candles, pool_data, "ETH", conn, initial_eth=16.666667)
 
         assert isinstance(results, list)
         if len(results) >= 2:
@@ -909,4 +1225,45 @@ class TestRunSweep:
         conn = MagicMock()
 
         with pytest.raises(ValueError, match="No Polymarket range"):
-            run_sweep(candles, pool_data, "ETH", 100000.0, conn)
+            run_sweep(candles, pool_data, "ETH", conn, initial_eth=16.666667)
+
+
+# ---------------------------------------------------------------------------
+# Insurance expiry rebalances
+# ---------------------------------------------------------------------------
+
+
+class TestInsuranceExpiry:
+
+    @pytest.mark.integration
+    @patch("active_backtester.get_historical_bet_price")
+    @patch("active_backtester.get_clob_token_id")
+    @patch("active_backtester.get_candidate_markets")
+    @patch("active_backtester._get_insurance_for_range")
+    def test_expiry_forces_close_with_zero_insurance(
+        self, mock_ins, mock_cands, mock_clob, mock_bet_price, pool_data
+    ):
+        """If either Polymarket market expires, we force-close and treat insurance as $0."""
+        from datetime import datetime, timezone
+
+        mock_ins.return_value = {"lower_bet_price": 0.5, "upper_bet_price": 0.5}
+        mock_clob.return_value = "0xclob"
+        mock_bet_price.return_value = 0.5
+
+        candles = make_candle_series(n=6, start_price=2000.0, price_delta=0.0)
+        exp_dt = datetime.fromtimestamp(int(candles[2]["periodStartUnix"]), tz=timezone.utc)
+        mock_cands.return_value = [{"clob_token_id": "0xclob", "market_id": 1, "end_date": exp_dt}]
+
+        conn = MagicMock()
+        positions, _, _ = simulate(
+            candles, pool_data, "ETH", 0.0, conn,
+            fixed_range=(1800.0, 2200.0),
+            cooldown_hours=0,
+            quiet=True,
+            initial_eth=10.0,
+        )
+
+        assert len(positions) >= 2
+        assert positions[0].get("close_reason") == "expiry"
+        assert positions[0].get("insurance_payout") == 0.0
+        assert positions[0].get("insurance_sellback") == 0.0

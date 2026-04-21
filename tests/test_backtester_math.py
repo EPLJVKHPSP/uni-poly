@@ -491,6 +491,44 @@ class TestBuildSummary:
         assert summary["active_strategy"]["total_gas_fees_usdc"] == pytest.approx(4.30, rel=1e-6)
 
 
+class TestBuildSummaryExternalCosts:
+
+    @pytest.mark.unit
+    def test_external_costs_mode_sets_cost_basis_and_total_value(self):
+        candles = [
+            {"periodStartUnix": "1700000000", "close": "3000.0"},
+            {"periodStartUnix": "1700003600", "close": "3000.0"},
+        ]
+        positions = [{
+            "open_ts": 1700000000, "close_ts": 1700003600,
+            "entry_price": 3000.0, "close_price": 3000.0,
+            "min_range": 2500.0, "max_range": 3500.0,
+            "fees_earned_usdc": 0.0, "fees_earned_eth": 0.0,
+            "fees_earned_usd": 0.0, "il": 0.0, "il_pct": 0.0,
+            "insurance_cost": 100.0, "insurance_payout": 50.0,
+            "insurance_sellback": 25.0, "insurance_net": -25.0,
+            "swap_fee": 0.0, "swap_amount": 0.0,
+            "gas_fee_open": 5.0, "gas_fee_close": 7.0,
+            "spread_cost_buy": 0.0, "spread_cost_sell": 0.0,
+            "slippage_cost_buy": 0.0, "slippage_cost_sell": 0.0,
+            "wallet_before": {"usdc": 10000.0, "eth": 3.0, "value_usd": 19000.0},
+            "wallet_after": {"usdc": 10000.0, "eth": 3.0, "value_usd": 19000.0},
+            "token0_dep": 10000.0, "token1_dep": 3.0,
+            "deposit_value": 19000.0,
+            "duration_hours": 1.0,
+            "touched_lower": False, "touched_upper": False,
+        }]
+        wallet = {"usdc": 10000.0, "eth": 3.0}
+        summary = build_summary(
+            positions, candles, 999.0, "0xpool", "ETH", wallet,
+            run_metadata={},
+        )
+        a = summary["active_strategy"]
+        assert a["external_costs"] is True
+        assert a["cost_basis_usd"] == pytest.approx(19000.0 + 12.0 + 100.0, rel=1e-12)
+        assert a["final_value_usd"] == pytest.approx(19000.0 + 75.0, rel=1e-12)
+
+
 # ---------------------------------------------------------------------------
 # gas_cost_usd
 # ---------------------------------------------------------------------------

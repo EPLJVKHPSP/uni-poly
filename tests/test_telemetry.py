@@ -42,6 +42,7 @@ class TestSimulationTelemetry:
             conn=None,
             fixed_range=(4000.0, 5000.0),
             telemetry=telemetry,
+            initial_eth=16.666667,
         )
 
         assert positions == []

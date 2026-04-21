@@ -41,9 +41,27 @@ from .positions import (  # noqa: F401
     close_position,
 )
 
+from .polymarket_execution import (  # noqa: F401
+    ClosePolicy,
+    SlippageConfig,
+    slippage_per_contract_usd,
+    apply_execution_costs,
+    choose_close_price,
+)
+
 from .simulation import (  # noqa: F401
     simulate,
     build_summary,
     run_sweep,
     main,
+)
+
+from .data_validation import (  # noqa: F401
+    CANDLE_INTERVAL_SECS,
+    CandleQualityReport,
+    GasCoverageReport,
+    PolymarketCoverageReport,
+    validate_candles,
+    validate_gas_coverage,
+    validate_polymarket_coverage,
 )
