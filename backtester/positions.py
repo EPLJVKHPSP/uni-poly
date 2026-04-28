@@ -1,7 +1,7 @@
 """Position open/close lifecycle."""
 
 import sys
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from il import (
     calculate_il_at_price,
@@ -9,7 +9,12 @@ from il import (
     tokens_from_liquidity,
 )
 
-from .polymarket_execution import SlippageConfig, apply_execution_costs
+from .polymarket_execution import (
+    PolymarketFeeModel,
+    SlippageConfig,
+    apply_execution_costs,
+    polymarket_taker_fee_usd,
+)
 from .fee_math import (
     _tokens_for_strategy_human,
     _tokens_for_strategy_scaled,
@@ -43,11 +48,25 @@ def open_position(
     upper_clob_token_id: Optional[str] = None,
     lower_end_ts: Optional[int] = None,
     upper_end_ts: Optional[int] = None,
+    fee_model: Optional[PolymarketFeeModel] = None,
+    book_lookup: Optional[Callable[[Optional[str], int], Optional[Tuple[List, List]]]] = None,
 ) -> Dict:
     """Open a position using the full wallet. Returns position record."""
     close_price = float(candle["close"])
     entry_price = close_price if price_token == 0 else 1.0 / close_price
     ts = int(candle["periodStartUnix"])
+
+    def _book_for(clob_id: Optional[str]) -> tuple[Optional[list], Optional[list]]:
+        if book_lookup is None or not clob_id:
+            return (None, None)
+        try:
+            res = book_lookup(clob_id, ts)
+        except Exception:
+            return (None, None)
+        if not res:
+            return (None, None)
+        bids, asks = res
+        return (bids, asks)
 
     dec0 = int(pool_data["token0"]["decimals"])
     dec1 = int(pool_data["token1"]["decimals"])
@@ -68,6 +87,7 @@ def open_position(
         contracts=0.0,  # placeholder; updated once contracts are known
         side="buy",
         slippage_cfg=slippage_cfg,
+        fee_model=fee_model,
     )
     upper_exec_ask, upper_spread_cost, upper_slip_cost = apply_execution_costs(
         mid_price=upper_mid,
@@ -75,6 +95,7 @@ def open_position(
         contracts=0.0,
         side="buy",
         slippage_cfg=slippage_cfg,
+        fee_model=fee_model,
     )
 
     # External-cost accounting is always ON:
@@ -98,12 +119,18 @@ def open_position(
     upper_contracts = abs(min(0, il_upper["IL"]))
 
     # Compute insurance execution costs for the final contract sizes.
+    lower_bids, lower_asks = _book_for(lower_clob_token_id)
+    upper_bids, upper_asks = _book_for(upper_clob_token_id)
     lower_exec_ask, lower_spread_cost, lower_slip_cost = apply_execution_costs(
         mid_price=lower_mid,
         spread=spread,
         contracts=lower_contracts,
         side="buy",
         slippage_cfg=slippage_cfg,
+        asset_id=lower_clob_token_id,
+        fee_model=fee_model,
+        book_bids=lower_bids,
+        book_asks=lower_asks,
     )
     upper_exec_ask, upper_spread_cost, upper_slip_cost = apply_execution_costs(
         mid_price=upper_mid,
@@ -111,7 +138,12 @@ def open_position(
         contracts=upper_contracts,
         side="buy",
         slippage_cfg=slippage_cfg,
+        asset_id=upper_clob_token_id,
+        fee_model=fee_model,
+        book_bids=upper_bids,
+        book_asks=upper_asks,
     )
+    book_used_open = bool(lower_asks) or bool(upper_asks)
 
     lower_cost = lower_contracts * lower_exec_ask
     upper_cost = upper_contracts * upper_exec_ask
@@ -119,6 +151,10 @@ def open_position(
 
     spread_cost_buy = lower_spread_cost + upper_spread_cost
     slippage_cost_buy = lower_slip_cost + upper_slip_cost
+    fee_cost_buy = (
+        polymarket_taker_fee_usd(lower_contracts, lower_exec_ask, fee_model)
+        + polymarket_taker_fee_usd(upper_contracts, upper_exec_ask, fee_model)
+    )
 
     token0_dep, token1_dep = _tokens_for_strategy_human(
         min_range, max_range, deposit_value, entry_price,
@@ -168,6 +204,8 @@ def open_position(
         "gas_fee_open": gas_open,
         "spread_cost_buy": spread_cost_buy,
         "slippage_cost_buy": slippage_cost_buy,
+        "polymarket_fee_buy": fee_cost_buy,
+        "book_used_open": book_used_open,
         "accumulated_fees_usdc": 0.0,
         "accumulated_fees_eth": 0.0,
         "candle_count": 0,
@@ -187,8 +225,29 @@ def close_position(
     slippage_cfg: Optional[SlippageConfig] = None,
     close_price_override: Optional[float] = None,
     expired: bool = False,
+    touch_settlement_haircut: float = 0.0,
+    sell_touched_at_market: bool = False,
+    fee_model: Optional[PolymarketFeeModel] = None,
+    book_lookup: Optional[Callable[[Optional[str], int], Optional[Tuple[List, List]]]] = None,
 ) -> Tuple[Dict, Dict]:
-    """Settle a position. Returns (pos, new_wallet)."""
+    """Settle a position. Returns (pos, new_wallet).
+
+    Polymarket settlement modelling:
+
+    - When ``sell_touched_at_market`` is False (legacy / unit-test default),
+      a touched-side YES is assumed to pay ``contracts * (1 - touch_settlement_haircut)``.
+      With the default haircut of 0 this is the original "$1 per contract"
+      behaviour preserved by the unit tests.
+    - When ``sell_touched_at_market`` is True (the realistic mode used by
+      ``simulate``), the touched-side YES is sold at the prevailing best-bid
+      drawn from ``bet_price_history`` at ``close_ts``, with execution costs
+      (spread + slippage) applied on the sell side. If no historical bid
+      exists for that timestamp we fall back to ``contracts * (1 - touch_settlement_haircut)``.
+
+    The untouched-side YES is always sold at the current bid when conn data
+    exists; if not, the sellback is **0** (no more silently inflating the
+    sellback with the entry-time mid).
+    """
     if close_price_override is not None:
         touch_price = float(close_price_override)
     else:
@@ -207,61 +266,142 @@ def close_position(
 
     close_ts = int(close_candle["periodStartUnix"])
 
-    payout = 0.0
-    insurance_sellback = 0.0
-    if not expired:
-        if touched_lower:
-            payout += pos["lower_contracts"]
-        if touched_upper:
-            payout += pos["upper_contracts"]
-
     get_clob_token_id = _get_db_func("get_clob_token_id")
     get_historical_bet_price = _get_db_func("get_historical_bet_price")
 
+    payout = 0.0
+    insurance_sellback = 0.0
     spread_cost_sell = 0.0
     slippage_cost_sell = 0.0
+    fee_cost_sell = 0.0
 
-    if (not expired) and (not touched_lower) and pos["lower_contracts"] > 0 and conn is not None:
-        lower_clob = pos.get("lower_clob_token_id") or get_clob_token_id(
+    book_used_close = {"flag": False}
+
+    def _book_for(clob_id: Optional[str]) -> tuple[Optional[list], Optional[list]]:
+        if book_lookup is None or not clob_id:
+            return (None, None)
+        try:
+            res = book_lookup(clob_id, close_ts)
+        except Exception:
+            return (None, None)
+        if not res:
+            return (None, None)
+        return res[0], res[1]
+
+    def _sell_yes(contracts: float, clob_id: Optional[str]) -> Tuple[float, float, float, float, bool]:
+        """Sell ``contracts`` of a YES at the strict-past bid drawn from DB.
+
+        Returns ``(proceeds_usd, spread_cost, slippage_cost, fee_cost, used_market_bid)``.
+        ``used_market_bid`` is False when no historical bid was available.
+        ``fee_cost`` is the Polymarket dynamic taker fee paid on the sell.
+
+        When an L2 snapshot is available via ``book_lookup`` we walk the bid
+        side directly; otherwise we fall back to the historical mid + fitted
+        slippage path.
+        """
+        if contracts <= 0 or not clob_id:
+            return 0.0, 0.0, 0.0, 0.0, False
+        bids, asks = _book_for(clob_id)
+        if bids:
+            book_used_close["flag"] = True
+            mid_for_call = float(bids[0]["price"]) if isinstance(bids[0], dict) else float(bids[0][0])
+            bid_exec, sp_cost, sl_cost = apply_execution_costs(
+                mid_price=mid_for_call,
+                spread=spread,
+                contracts=float(contracts),
+                side="sell",
+                slippage_cfg=slippage_cfg,
+                asset_id=clob_id,
+                fee_model=fee_model,
+                book_bids=bids,
+                book_asks=asks,
+            )
+            fee = polymarket_taker_fee_usd(float(contracts), bid_exec, fee_model)
+            return contracts * bid_exec, sp_cost, sl_cost, fee, True
+        if conn is None:
+            return 0.0, 0.0, 0.0, 0.0, False
+        mid_price = get_historical_bet_price(clob_id, close_ts, conn)
+        if mid_price is None:
+            return 0.0, 0.0, 0.0, 0.0, False
+        bid_exec, sp_cost, sl_cost = apply_execution_costs(
+            mid_price=float(mid_price),
+            spread=spread,
+            contracts=float(contracts),
+            side="sell",
+            slippage_cfg=slippage_cfg,
+            asset_id=clob_id,
+            fee_model=fee_model,
+        )
+        fee = polymarket_taker_fee_usd(float(contracts), bid_exec, fee_model)
+        return contracts * bid_exec, sp_cost, sl_cost, fee, True
+
+    lower_clob = pos.get("lower_clob_token_id")
+    upper_clob = pos.get("upper_clob_token_id")
+    if conn is not None and lower_clob is None and pos["lower_contracts"] > 0:
+        lower_clob = get_clob_token_id(
             token_symbol, pos["min_range"], "down", "Yes", conn, candle_ts=close_ts
         )
-        mid_price = None
-        if lower_clob:
-            mid_price = get_historical_bet_price(lower_clob, close_ts, conn)
-        if mid_price is None:
-            # Fallback when DB history is missing: use the stored entry-time mid.
-            mid_price = float(pos.get("lower_bet_price", 0.5))
-        bid_exec, sp_cost, sl_cost = apply_execution_costs(
-            mid_price=mid_price,
-            spread=spread,
-            contracts=pos["lower_contracts"],
-            side="sell",
-            slippage_cfg=slippage_cfg,
-        )
-        insurance_sellback += pos["lower_contracts"] * bid_exec
-        spread_cost_sell += sp_cost
-        slippage_cost_sell += sl_cost
-
-    if (not expired) and (not touched_upper) and pos["upper_contracts"] > 0 and conn is not None:
-        upper_clob = pos.get("upper_clob_token_id") or get_clob_token_id(
+    if conn is not None and upper_clob is None and pos["upper_contracts"] > 0:
+        upper_clob = get_clob_token_id(
             token_symbol, pos["max_range"], "up", "Yes", conn, candle_ts=close_ts
         )
-        mid_price = None
-        if upper_clob:
-            mid_price = get_historical_bet_price(upper_clob, close_ts, conn)
-        if mid_price is None:
-            # Fallback when DB history is missing: use the stored entry-time mid.
-            mid_price = float(pos.get("upper_bet_price", 0.5))
-        bid_exec, sp_cost, sl_cost = apply_execution_costs(
-            mid_price=mid_price,
-            spread=spread,
-            contracts=pos["upper_contracts"],
-            side="sell",
-            slippage_cfg=slippage_cfg,
-        )
-        insurance_sellback += pos["upper_contracts"] * bid_exec
-        spread_cost_sell += sp_cost
-        slippage_cost_sell += sl_cost
+
+    if expired:
+        # Force-close at insurance market expiry: sell BOTH legs at the
+        # prevailing bid (one leg will be near-1, the other near-0). No
+        # special "payout" claim — that's accounted for via the bid itself.
+        if pos["lower_contracts"] > 0:
+            proceeds, sp, sl, fc, _ok = _sell_yes(pos["lower_contracts"], lower_clob)
+            insurance_sellback += proceeds
+            spread_cost_sell += sp
+            slippage_cost_sell += sl
+            fee_cost_sell += fc
+        if pos["upper_contracts"] > 0:
+            proceeds, sp, sl, fc, _ok = _sell_yes(pos["upper_contracts"], upper_clob)
+            insurance_sellback += proceeds
+            spread_cost_sell += sp
+            slippage_cost_sell += sl
+            fee_cost_sell += fc
+    else:
+        if touched_lower and pos["lower_contracts"] > 0:
+            if sell_touched_at_market:
+                proceeds, sp, sl, fc, ok = _sell_yes(pos["lower_contracts"], lower_clob)
+                if ok:
+                    payout += proceeds
+                    spread_cost_sell += sp
+                    slippage_cost_sell += sl
+                    fee_cost_sell += fc
+                else:
+                    payout += pos["lower_contracts"] * (1.0 - touch_settlement_haircut)
+            else:
+                payout += pos["lower_contracts"] * (1.0 - touch_settlement_haircut)
+
+        if touched_upper and pos["upper_contracts"] > 0:
+            if sell_touched_at_market:
+                proceeds, sp, sl, fc, ok = _sell_yes(pos["upper_contracts"], upper_clob)
+                if ok:
+                    payout += proceeds
+                    spread_cost_sell += sp
+                    slippage_cost_sell += sl
+                    fee_cost_sell += fc
+                else:
+                    payout += pos["upper_contracts"] * (1.0 - touch_settlement_haircut)
+            else:
+                payout += pos["upper_contracts"] * (1.0 - touch_settlement_haircut)
+
+        if not touched_lower and pos["lower_contracts"] > 0:
+            proceeds, sp, sl, fc, _ok = _sell_yes(pos["lower_contracts"], lower_clob)
+            insurance_sellback += proceeds
+            spread_cost_sell += sp
+            slippage_cost_sell += sl
+            fee_cost_sell += fc
+
+        if not touched_upper and pos["upper_contracts"] > 0:
+            proceeds, sp, sl, fc, _ok = _sell_yes(pos["upper_contracts"], upper_clob)
+            insurance_sellback += proceeds
+            spread_cost_sell += sp
+            slippage_cost_sell += sl
+            fee_cost_sell += fc
 
     # Withdrawal must come from the position's *liquidity*, not from re-splitting
     # ``deposit_value`` at ``touch_price`` (which is only correct when
@@ -299,7 +439,7 @@ def close_position(
     pos["il"] = il["IL"]
     pos["il_pct"] = il["IL_pct"]
     pos["insurance_payout"] = 0.0 if expired else payout
-    pos["insurance_sellback"] = 0.0 if expired else insurance_sellback
+    pos["insurance_sellback"] = insurance_sellback
     pos["insurance_net"] = pos["insurance_payout"] + pos["insurance_sellback"] - pos["insurance_cost"]
     pos["fees_earned_usdc"] = fees_usdc
     pos["fees_earned_eth"] = fees_eth
@@ -307,6 +447,9 @@ def close_position(
     pos["gas_fee_close"] = gas_close
     pos["spread_cost_sell"] = spread_cost_sell
     pos["slippage_cost_sell"] = slippage_cost_sell
+    pos["polymarket_fee_sell"] = fee_cost_sell
+    pos["polymarket_fee_total"] = pos.get("polymarket_fee_buy", 0.0) + fee_cost_sell
+    pos["book_used_close"] = bool(book_used_close["flag"])
     pos["wallet_after"] = {"usdc": new_wallet_usdc, "eth": new_wallet_eth, "value_usd": new_wallet_value}
     pos["duration_hours"] = (pos["close_ts"] - pos["open_ts"]) / 3600
     if expired:

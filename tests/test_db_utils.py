@@ -138,14 +138,29 @@ class TestGetHistoricalBetPrice:
         assert result == 0.35
 
     @pytest.mark.integration
-    def test_fallback_to_after_target(self):
+    def test_strict_past_default_returns_none_when_only_future_data(self):
+        """No-lookahead default: do NOT fall back to a future row."""
+        cursor = MagicMock()
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=cursor)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        cursor.fetchone.return_value = None
+
+        result = db_utils.get_historical_bet_price("0xabc", 1700000000, conn)
+        assert result is None
+
+    @pytest.mark.integration
+    def test_explicit_non_strict_falls_back_to_future(self):
+        """Opting out of strict_past restores the legacy nearest-row behaviour."""
         cursor = MagicMock()
         conn = MagicMock()
         conn.cursor.return_value.__enter__ = MagicMock(return_value=cursor)
         conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
         cursor.fetchone.side_effect = [None, ("0.42",)]
 
-        result = db_utils.get_historical_bet_price("0xabc", 1700000000, conn)
+        result = db_utils.get_historical_bet_price(
+            "0xabc", 1700000000, conn, strict_past=False
+        )
         assert result == 0.42
 
     @pytest.mark.integration
@@ -156,7 +171,9 @@ class TestGetHistoricalBetPrice:
         conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
         cursor.fetchone.side_effect = [None, None]
 
-        result = db_utils.get_historical_bet_price("0xabc", 1700000000, conn)
+        result = db_utils.get_historical_bet_price(
+            "0xabc", 1700000000, conn, strict_past=False
+        )
         assert result is None
 
     @pytest.mark.integration

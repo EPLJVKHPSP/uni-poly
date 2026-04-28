@@ -1240,10 +1240,12 @@ class TestInsuranceExpiry:
     @patch("active_backtester.get_clob_token_id")
     @patch("active_backtester.get_candidate_markets")
     @patch("active_backtester._get_insurance_for_range")
-    def test_expiry_forces_close_with_zero_insurance(
+    def test_expiry_forces_close_and_sells_legs_at_market(
         self, mock_ins, mock_cands, mock_clob, mock_bet_price, pool_data
     ):
-        """If either Polymarket market expires, we force-close and treat insurance as $0."""
+        """On expiry we force-close, drop the touch-payout claim, but DO sell
+        both legs at the prevailing bid (was previously zeroed-out, which made
+        the hedge look artificially worse)."""
         from datetime import datetime, timezone
 
         mock_ins.return_value = {"lower_bet_price": 0.5, "upper_bet_price": 0.5}
@@ -1265,5 +1267,8 @@ class TestInsuranceExpiry:
 
         assert len(positions) >= 2
         assert positions[0].get("close_reason") == "expiry"
+        # No "touch" claim on expiry.
         assert positions[0].get("insurance_payout") == 0.0
-        assert positions[0].get("insurance_sellback") == 0.0
+        # But the legs are sold at the prevailing bid (mid 0.5 - spread/2 = 0.5
+        # with default spread=0); proceeds must be non-negative.
+        assert positions[0].get("insurance_sellback") >= 0.0

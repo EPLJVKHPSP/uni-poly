@@ -270,6 +270,88 @@ EXCLUDE_OTHER_KEYWORDS = [
 ]
 
 
+def classify_resolution_type(question_text: str, description_text: str) -> str:
+    """Classify how a Polymarket market resolves.
+
+    Only ``touch_any_time`` markets are structurally suitable as IL insurance:
+    they pay $1 the moment the underlying ever touches the level before
+    expiry, which matches the geometry of an LP's barrier-hit risk. All other
+    resolution rules introduce basis risk (the hedge can pay nothing even
+    when the LP gets fully ranged-out, or vice versa).
+
+    Returns one of:
+      - "touch_any_time"   (good — pays on any historical touch)
+      - "close_on_date"    (resolves to the price on a specific date)
+      - "period_end"       (resolves at the end of a period — week/month/year)
+      - "average_period"   (resolves to TWAP/average over a period)
+      - "unknown"          (insufficient/contradictory evidence)
+    """
+    q = (question_text or "").lower()
+    d = (description_text or "").lower()
+    blob = f"{q} {d}"
+
+    # Strongest signal: explicit "any time" / "at any point" / "ever" wording.
+    touch_signals = [
+        "any time",
+        "at any time",
+        "anytime",
+        "at any point",
+        "ever",
+        " dip ",
+        " dip-",
+        "dip to",
+        "dips to",
+        "will dip",
+        "reach",
+        "reaches",
+        "hit ",
+        "hits ",
+        "touch",
+        "touches",
+    ]
+    if any(s in blob for s in touch_signals):
+        return "touch_any_time"
+
+    # Date-locked: "on <date>", "on the date", resolution sources that point at
+    # a single timestamp. Includes Polymarket's hourly close-price boilerplate
+    # ("...the Close price for the BTC/USDT 1 hour candle that ends on...").
+    date_locked_signals = [
+        "on the date of resolution",
+        "as of the resolution date",
+        "closing price on",
+        "price on ",
+        "price-on-",
+        "above-on-",
+        "below-on-",
+        "close price for the",
+        "1 hour candle that ends",
+        "1h candle that ends",
+        "candle that ends on the time",
+    ]
+    if any(s in blob for s in date_locked_signals):
+        return "close_on_date"
+
+    # Period end style: end-of-month/year/quarter tickets.
+    period_end_signals = [
+        "end of the month",
+        "end of the year",
+        "end of the quarter",
+        "end of q",
+        "end-of-month",
+        "end-of-year",
+        "end-of-quarter",
+    ]
+    if any(s in blob for s in period_end_signals):
+        return "period_end"
+
+    # TWAP / average style.
+    avg_signals = ["average", "twap", "vwap", "mean over"]
+    if any(s in blob for s in avg_signals):
+        return "average_period"
+
+    return "unknown"
+
+
 def is_price_like_event(event):
     """Decide if an event is a price-related crypto market worth keeping."""
     slug = (event.get("slug") or "").lower()
@@ -298,6 +380,61 @@ def is_price_like_event(event):
 
     # Keep only clearly price/level related markets
     return any(good in text for good in INCLUDE_PRICE_KEYWORDS)
+
+
+def fetch_events_by_slugs(slugs, batch_size: int = 50, sleep_s: float = 0.05) -> list:
+    """Fetch full event objects for a list of known slugs from Gamma.
+
+    Gamma's ``GET /events?slug=A&slug=B&...`` accepts multiple ``slug`` values
+    in a single call. **The default ``limit`` is 1**, so we MUST pass an
+    explicit ``limit`` ≥ batch size or the API silently truncates the response
+    to a single event. Empty hits (slug not deployed) are skipped.
+    Returns a flat list of event dicts. Slugs that 404/return [] are ignored.
+    """
+    url = "https://gamma-api.polymarket.com/events"
+    found: list = []
+    slugs = list(slugs)
+    total = len(slugs)
+    if total == 0:
+        return found
+    for start in range(0, total, batch_size):
+        batch = slugs[start : start + batch_size]
+        # ``limit`` MUST equal at least the batch size (default is 1).
+        params = [("slug", s) for s in batch] + [("limit", str(max(batch_size, 50)))]
+        last_err = None
+        data = None
+        for attempt in range(5):
+            try:
+                resp = requests.get(url, params=params, timeout=20)
+                resp.raise_for_status()
+                data = resp.json()
+                last_err = None
+                break
+            except requests.HTTPError as e:
+                last_err = e
+                status = getattr(e.response, "status_code", None)
+                if status is not None and status >= 500:
+                    time.sleep(0.4 * (2 ** attempt))
+                    continue
+                if status == 404:
+                    data = []
+                    break
+                raise
+            except Exception as e:
+                last_err = e
+                time.sleep(0.4 * (2 ** attempt))
+        if data is None:
+            print(f"[gamma] slug batch {start}/{total} failed: {last_err}")
+            continue
+        if isinstance(data, list):
+            found.extend(data)
+        elif isinstance(data, dict):
+            found.extend(data.get("events", []) or data.get("data", []) or [])
+        if (start // batch_size) % 20 == 0:
+            print(f"[gamma] slug fetch progress: {start + len(batch)}/{total} (events kept: {len(found)})")
+        time.sleep(sleep_s)
+    print(f"[gamma] slug fetch complete: {len(found)} non-empty events from {total} slugs")
+    return found
 
 
 def fetch_events_keyset(*, closed: bool, end_date_min=None, tag_slug=None, max_events=None) -> list:
@@ -391,54 +528,8 @@ def sync_price_events():
     # Fetch ATH levels for configured underlyings from CoinGecko
     ath_by_symbol = fetch_ath_by_symbol()
 
-    # Create table if it doesn't exist (non-destructive)
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS price_events (
-            event_id        BIGINT,
-            event_slug      TEXT,
-            event_title     TEXT,
-            underlying      TEXT,
-            market_id       BIGINT,
-            market_question TEXT,
-            side            TEXT,
-            level           NUMERIC,
-            direction       TEXT,
-            price           NUMERIC,
-            event_volume    NUMERIC,
-            market_volume   NUMERIC,
-            end_date        TIMESTAMPTZ,
-            created_at      TIMESTAMPTZ,
-            closed_time     TIMESTAMPTZ,
-            active          BOOLEAN,
-            clob_token_id   TEXT,
-            PRIMARY KEY (market_id, side)
-        )
-        """
-    )
-
-    # Create indexes for better query performance
-    cur.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_price_events_underlying 
-        ON price_events(underlying) WHERE active = true
-        """
-    )
-    cur.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_price_events_level_direction 
-        ON price_events(underlying, level, direction, side) WHERE active = true
-        """
-    )
-    # Ensure a unique constraint exists for ON CONFLICT target
-    cur.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_price_events_market_side
-        ON price_events(market_id, side)
-        """
-    )
-
-    # Add clob_token_id column if it doesn't exist (migration for existing DBs)
+    _ensure_price_events_schema(cur)
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_price_events_market_side ON price_events(market_id, side)")
     cur.execute(
         """
         DO $$
@@ -476,15 +567,26 @@ def sync_price_events():
     )
     conn.commit()
 
-    # Fetch open + closed events (closed events are scoped to recent history to avoid huge pulls)
+    # Restrict to a small set of underlyings (default ETH+BTC; the only assets
+    # with deep, hourly-trading strike-style markets that overlap a WETH/USDC
+    # LP). Override via ``ALLOWED_UNDERLYINGS=BTC,ETH,SOL`` env var.
+    raw_allow = (os.getenv("ALLOWED_UNDERLYINGS") or "ETH,BTC").upper()
+    allowed_underlyings = {s.strip() for s in raw_allow.split(",") if s.strip()}
+    print(f"[etl] underlying allow-list: {sorted(allowed_underlyings)}")
+
+    # Closed-events lookback. The default LP backtest window is ~60 days, so
+    # 120 days of closed events is plenty (covers warmup + a small buffer).
+    # Override with CLOSED_LOOKBACK_DAYS=180 if you need deeper history.
+    closed_lookback_days = int(os.getenv("CLOSED_LOOKBACK_DAYS", "120"))
+
     print("[gamma] fetching open events...")
     open_events = fetch_events_keyset(closed=False, tag_slug="crypto")
     print(f"[gamma] open events fetched: {len(open_events)}")
-    print("[gamma] fetching closed events...")
+    print(f"[gamma] fetching closed events (last {closed_lookback_days}d)...")
     max_closed = os.getenv("MAX_CLOSED_EVENTS")
     closed_events = fetch_events_keyset(
         closed=True,
-        end_date_min=datetime.now(timezone.utc) - timedelta(days=180),
+        end_date_min=datetime.now(timezone.utc) - timedelta(days=closed_lookback_days),
         tag_slug="crypto",
         max_events=int(max_closed) if max_closed not in (None, "", "null") else None,
     )
@@ -492,34 +594,121 @@ def sync_price_events():
     events = open_events + closed_events
     print(f"[etl] total events to process: {len(events)}")
 
+    written = _process_and_upsert_events(
+        events,
+        cur,
+        ath_by_symbol,
+        allowed_underlyings=allowed_underlyings,
+        apply_event_filters=True,
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    print(f"[etl] wrote {written} rows to price_events")
+
+
+def sync_strike_slugs(
+    start: "date | datetime | str",
+    end: "date | datetime | str",
+    *,
+    assets=("BTC", "ETH"),
+    include_daily: bool = True,
+    include_hourly: bool = True,
+    hours=range(24),
+):
+    """Targeted ingestion: build the expected strike-market slugs for the
+    backtest window and fetch only those events from Gamma.
+
+    Far cheaper than ``sync_price_events`` (no 16k-event keyset crawl). Use
+    when you know the backtest window up-front.
+    """
+    from polymarket_history_pkg.strike_slugs import all_strike_slugs, parse_iso_date
+
+    start_d = parse_iso_date(start)
+    end_d = parse_iso_date(end)
+    candidates = all_strike_slugs(
+        start_d, end_d, assets=assets,
+        include_daily=include_daily, include_hourly=include_hourly, hours=hours,
+    )
+    slugs = [c.slug for c in candidates]
+    print(
+        f"[targeted] generating {len(slugs)} candidate slugs "
+        f"({start_d.isoformat()} .. {end_d.isoformat()}, assets={list(assets)}, "
+        f"daily={include_daily}, hourly={include_hourly})"
+    )
+
+    events = fetch_events_by_slugs(slugs)
+
+    conn = psycopg2.connect(
+        dbname=os.getenv("DB_NAME", "polymarket"),
+        user=os.getenv("DB_USER", "polymarket"),
+        password=os.getenv("DB_PASSWORD", "polymarket_pw"),
+        host=os.getenv("DB_HOST", "localhost"),
+        port=int(os.getenv("DB_PORT", "5432")),
+    )
+    cur = conn.cursor()
+    _ensure_price_events_schema(cur)
+    conn.commit()
+
+    ath_by_symbol = fetch_ath_by_symbol()
+    allowed = {a.upper() for a in assets}
+
+    written = _process_and_upsert_events(
+        events,
+        cur,
+        ath_by_symbol,
+        allowed_underlyings=allowed,
+        apply_event_filters=False,  # slugs are already strike-only by construction
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    print(f"[targeted] wrote {written} rows to price_events from {len(events)} events")
+
+
+def _process_and_upsert_events(
+    events,
+    cur,
+    ath_by_symbol,
+    *,
+    allowed_underlyings,
+    apply_event_filters: bool,
+) -> int:
+    """Walk events → markets → upsert into ``price_events``.
+
+    When ``apply_event_filters`` is True we run the keyset-style heuristics
+    (``is_price_like_event``, allowlist underlying inference). The targeted
+    slug path skips them because the slug catalogue is already exact.
+    """
     written = 0
     for event in events:
-        # Require a valid end_date
         end_date_str = event.get("endDate")
         if not end_date_str:
             continue
-
         try:
             end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
         except Exception:
             continue
 
         is_closed_event = bool(event.get("closed"))
-        if not is_closed_event:
-            # For *open* events only, skip very short-term events (< ~1 week)
+        if apply_event_filters and not is_closed_event:
             if end_dt - datetime.now(timezone.utc) < timedelta(days=7):
                 continue
-
-        # Only keep clearly price-related events (no short-term up/down, no FDV)
-        if not is_price_like_event(event):
+        if apply_event_filters and not is_price_like_event(event):
             continue
+        if apply_event_filters:
+            event_underlying_guess = infer_underlying_symbol([event.get("title"), event.get("slug")])
+            if event_underlying_guess and event_underlying_guess not in allowed_underlyings:
+                continue
 
-        # Event-level volume
         event_volume = to_decimal(event.get("volume"))
 
         for market in event.get("markets", []):
             market_id = market.get("id")
             question = market.get("question")
+            market_description = market.get("description") or ""
+            resolution_type = classify_resolution_type(question, market_description)
+            condition_id = market.get("conditionId")
 
             market_created_at = market.get("createdAt")
             market_closed_time = market.get("closedTime")
@@ -554,8 +743,20 @@ def sync_price_events():
             if not underlying:
                 # Skip non-token-specific markets (e.g. MicroStrategy NAV, macro, etc.)
                 continue
+            if underlying not in allowed_underlyings:
+                # Final safety net: even if event title was generic, drop markets
+                # whose inferred underlying is outside our allow-list.
+                continue
 
             level, direction = infer_level_and_direction(question)
+            # Strike-only filter: drop markets without a numeric price level (these
+            # are "Will X happen?" markets that can't function as an IL hedge).
+            # We allow ATH-style markets to pass since their level is filled in
+            # below from CoinGecko.
+            combined_text_check = f"{(event.get('title') or '')} {question or ''}".lower()
+            is_ath_like = any(kw in combined_text_check for kw in ("all time high", "all-time high", " ath ", "ath?", "ath."))
+            if level is None and not is_ath_like:
+                continue
 
             # If this is an all‑time‑high style market, always override the level with CoinGecko ATH
             combined_text = f"{(event.get('title') or '')} {question or ''}".lower()
@@ -577,18 +778,22 @@ def sync_price_events():
                     """
                     INSERT INTO price_events
                     (event_id, event_slug, event_title, underlying,
-                     market_id, market_question, side, level, direction,
+                     market_id, market_question, market_description, resolution_type,
+                     condition_id, side, level, direction,
                      price, event_volume, market_volume, end_date,
                      created_at, closed_time,
                      active, clob_token_id)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (market_id, side) 
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (market_id, side)
                     DO UPDATE SET
                         event_id = EXCLUDED.event_id,
                         event_slug = EXCLUDED.event_slug,
                         event_title = EXCLUDED.event_title,
                         underlying = EXCLUDED.underlying,
                         market_question = EXCLUDED.market_question,
+                        market_description = EXCLUDED.market_description,
+                        resolution_type = EXCLUDED.resolution_type,
+                        condition_id = EXCLUDED.condition_id,
                         level = EXCLUDED.level,
                         direction = EXCLUDED.direction,
                         price = EXCLUDED.price,
@@ -607,6 +812,9 @@ def sync_price_events():
                         underlying,
                         market_id,
                         question,
+                        market_description,
+                        resolution_type,
+                        condition_id,
                         side,
                         level,
                         direction,
@@ -624,11 +832,79 @@ def sync_price_events():
                 if written % 2000 == 0:
                     print(f"[db] upserted {written} rows...")
 
-    conn.commit()
-    cur.close()
-    conn.close()
-    print(f"[done] upserted rows: {written}")
+    return written
+
+
+def _ensure_price_events_schema(cur) -> None:
+    """Idempotent schema bootstrap for ``price_events`` (also used by targeted mode)."""
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS price_events (
+            event_id        BIGINT,
+            event_slug      TEXT,
+            event_title     TEXT,
+            underlying      TEXT,
+            market_id       BIGINT,
+            market_question TEXT,
+            market_description TEXT,
+            resolution_type TEXT,
+            side            TEXT,
+            level           NUMERIC,
+            direction       TEXT,
+            price           NUMERIC,
+            event_volume    NUMERIC,
+            market_volume   NUMERIC,
+            end_date        TIMESTAMPTZ,
+            created_at      TIMESTAMPTZ,
+            closed_time     TIMESTAMPTZ,
+            active          BOOLEAN,
+            clob_token_id   TEXT,
+            condition_id    TEXT,
+            PRIMARY KEY (market_id, side)
+        )
+        """
+    )
+    for col, ddl in (
+        ("market_description", "ALTER TABLE price_events ADD COLUMN IF NOT EXISTS market_description TEXT"),
+        ("resolution_type",    "ALTER TABLE price_events ADD COLUMN IF NOT EXISTS resolution_type TEXT"),
+        ("condition_id",       "ALTER TABLE price_events ADD COLUMN IF NOT EXISTS condition_id TEXT"),
+    ):
+        cur.execute(ddl)
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_price_events_underlying ON price_events(underlying) WHERE active = true"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_price_events_lookup ON price_events(underlying, level, direction, side) WHERE active = true"
+    )
 
 
 if __name__ == "__main__":
-    sync_price_events()
+    import argparse
+    from datetime import date
+
+    ap = argparse.ArgumentParser(description="Polymarket strike-market ETL")
+    ap.add_argument(
+        "--mode",
+        choices=("keyset", "targeted"),
+        default=os.getenv("PARSER_MODE", "targeted"),
+        help="keyset: paginate /events?tag_slug=crypto. targeted: build expected ETH/BTC strike slugs and fetch only those.",
+    )
+    ap.add_argument("--start", default=None, help="targeted-mode start date (YYYY-MM-DD). Default: today - 60d")
+    ap.add_argument("--end",   default=None, help="targeted-mode end date (YYYY-MM-DD). Default: today + 7d")
+    ap.add_argument("--no-daily",  action="store_true", help="targeted: skip daily 'what-price-will-X-hit' events")
+    ap.add_argument("--no-hourly", action="store_true", help="targeted: skip hourly 'X-above-on-DATE-HOUR' events")
+    ap.add_argument("--assets", default="BTC,ETH", help="comma-separated underlyings (BTC,ETH supported)")
+    args = ap.parse_args()
+
+    if args.mode == "keyset":
+        sync_price_events()
+    else:
+        today = datetime.now(timezone.utc).date()
+        start_d = date.fromisoformat(args.start) if args.start else today - timedelta(days=60)
+        end_d = date.fromisoformat(args.end) if args.end else today + timedelta(days=7)
+        sync_strike_slugs(
+            start_d, end_d,
+            assets=tuple(s.strip() for s in args.assets.split(",") if s.strip()),
+            include_daily=not args.no_daily,
+            include_hourly=not args.no_hourly,
+        )

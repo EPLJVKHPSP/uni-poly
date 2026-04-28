@@ -410,11 +410,16 @@ def make_rebalances_table(summary: Dict[str, Any]) -> go.Figure:
             return ""
 
     rows = []
-    for i, p in enumerate(summary.get("positions") or [], start=1):
+    positions = summary.get("positions") or []
+    prev_reason: Optional[str] = None
+    for i, p in enumerate(positions, start=1):
         rng = p.get("range") or [None, None]
         mn = _as_float(rng[0], default=None)
         mx = _as_float(rng[1], default=None)
         reason = str(p.get("close_reason") or "")
+        trigger_short, _ = _entry_trigger(prev_reason, i)
+        prev_reason = reason
+        m = _position_entry_metrics(p)
 
         wb = p.get("wallet_before") or {}
         wa = p.get("wallet_after") or {}
@@ -425,11 +430,16 @@ def make_rebalances_table(summary: Dict[str, Any]) -> go.Figure:
                 i,
                 _date_only(p.get("open", "")),
                 _date_only(p.get("close", "")),
+                trigger_short,
                 reason,
                 f"[{_fmt_num(mn, 0)}–{_fmt_num(mx, 0)}]" if mn is not None and mx is not None else "",
+                _fmt_pct(m["width_pct"], 1),
+                _fmt_pct(m["lower_buf_pct"], 1),
+                _fmt_pct(m["upper_buf_pct"], 1),
                 _fmt_money(p.get("entry_price")),
                 _fmt_money(p.get("close_price")),
                 _fmt_money(p.get("insurance_cost_usdc")),
+                _fmt_pct(m["ins_pct_of_deposit"], 2),
                 _fmt_money(p.get("insurance_payout_usdc")),
                 _fmt_money(p.get("insurance_sellback_usdc")),
                 _fmt_money(p.get("fees_earned_usd")),
@@ -442,13 +452,18 @@ def make_rebalances_table(summary: Dict[str, Any]) -> go.Figure:
         "<b>#</b>",
         "<b>Open</b>",
         "<b>Close</b>",
-        "<b>Reason</b>",
+        "<b>Why entered</b>",
+        "<b>Why closed</b>",
         "<b>Range</b>",
-        "<b>Entry</b>",
-        "<b>Close</b>",
-        "<b>Ins buy (EXEC)</b>",
+        "<b>Width</b>",
+        "<b>Buf ↓</b>",
+        "<b>Buf ↑</b>",
+        "<b>Entry $</b>",
+        "<b>Close $</b>",
+        "<b>Ins buy</b>",
+        "<b>Ins / Dep</b>",
         "<b>Ins payout</b>",
-        "<b>Ins sell (EXEC)</b>",
+        "<b>Ins sell</b>",
         "<b>Fees</b>",
         "<b>IL</b>",
         "<b>Δ Wallet (USD)</b>",
@@ -463,7 +478,7 @@ def make_rebalances_table(summary: Dict[str, Any]) -> go.Figure:
                     values=headers,
                     fill_color="rgb(245,245,245)",
                     line_color="rgb(220,220,220)",
-                    font=dict(size=12),
+                    font=dict(size=11),
                     height=28,
                     align="center",
                 ),
@@ -475,11 +490,19 @@ def make_rebalances_table(summary: Dict[str, Any]) -> go.Figure:
                     height=20,
                     align="center",
                 ),
-                columnwidth=[0.04, 0.08, 0.08, 0.08, 0.10, 0.06, 0.06, 0.09, 0.09, 0.09, 0.06, 0.06, 0.12],
+                columnwidth=[
+                    0.025, 0.06, 0.06,
+                    0.075, 0.06,
+                    0.075, 0.04, 0.04, 0.04,
+                    0.05, 0.05,
+                    0.06, 0.05,
+                    0.06, 0.06,
+                    0.05, 0.05, 0.07,
+                ],
             )
         ]
     )
-    fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=460)
+    fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=520)
     return fig
 
 
@@ -582,6 +605,59 @@ def make_rebalances_table_mid(summary: Dict[str, Any]) -> go.Figure:
     return fig
 
 
+def _entry_trigger(prev_close_reason: Optional[str], idx: int) -> Tuple[str, str]:
+    """Why did we open position ``idx``?
+
+    Returns ``(short_label, long_label)``. The short label is meant for the
+    trade table, the long label is used in tooltips / explainers.
+
+    Trigger logic mirrors ``backtester/simulation.py``:
+
+      - Position #1 always opens at the very first usable candle.
+      - If the previous position closed because the LP range was breached
+        (``lower`` / ``upper``), we rebalance into a fresh range immediately
+        after the cooldown — this is a *price-driven* re-entry.
+      - If the previous position closed because the hedge market expired
+        (``expiry`` / ``period_end``), we open a new position because the
+        old insurance legs no longer exist; this is a *time-driven*
+        rollover, not a market signal.
+    """
+    if idx == 1 or not prev_close_reason:
+        return ("first open", "First open of the backtest")
+    pr = (prev_close_reason or "").strip().lower()
+    if pr == "lower":
+        return ("rebalance ↓", "Previous LP range was breached on the LOWER bound — repositioned")
+    if pr == "upper":
+        return ("rebalance ↑", "Previous LP range was breached on the UPPER bound — repositioned")
+    if pr == "expiry":
+        return ("hedge expired", "Insurance market expired (no breach) — rolled to a fresh market")
+    if pr == "period_end":
+        return ("period end", "End of backtest window (forced close)")
+    return (pr or "—", f"Re-opened after previous close ({pr or 'unknown'})")
+
+
+def _position_entry_metrics(p: Dict[str, Any]) -> Dict[str, Any]:
+    """Geometry & cost ratios that explain *why* this range was attractive."""
+    rng = p.get("range") or [None, None]
+    mn = _as_float(rng[0], default=None)
+    mx = _as_float(rng[1], default=None)
+    price = _as_float(p.get("entry_price"), default=None)
+    width_pct = lower_buf = upper_buf = None
+    if mn is not None and mx is not None and price and price > 0:
+        width_pct = (mx - mn) / price * 100.0
+        lower_buf = (price - mn) / price * 100.0
+        upper_buf = (mx - price) / price * 100.0
+    deposit_usd = _as_float((p.get("deposit") or {}).get("value_usd"), default=None)
+    ins_cost = _as_float(p.get("insurance_cost_usdc"), default=0.0)
+    ins_pct = (ins_cost / deposit_usd * 100.0) if (deposit_usd and deposit_usd > 0) else None
+    return {
+        "width_pct": width_pct,
+        "lower_buf_pct": lower_buf,
+        "upper_buf_pct": upper_buf,
+        "ins_pct_of_deposit": ins_pct,
+    }
+
+
 def parse_positions(summary: Dict[str, Any]) -> List[PositionEvent]:
     out: List[PositionEvent] = []
     for i, p in enumerate(summary.get("positions", []), start=1):
@@ -672,14 +748,25 @@ def make_price_and_range_figure(snaps: Dict[str, List[Any]], positions: Optional
         close_y: List[float] = []
         close_text: List[str] = []
         close_color: List[str] = []
-        for p in positions:
+        prev_reason: Optional[str] = None
+        for idx, p in enumerate(positions, start=1):
             try:
                 mn, mx = (p.get("range") or [None, None])[:2]
                 cr = str(p.get("close_reason") or "")
+                trig_short, trig_long = _entry_trigger(prev_reason, idx)
+                prev_reason = cr
+                m = _position_entry_metrics(p)
                 entry_x.append(_dt_from_iso(str(p["open"])))
                 entry_y.append(float(p.get("entry_price")))
                 entry_text.append(
-                    f"Enter<br>Range: [{mn:.0f}, {mx:.0f}]<br>Price: ${float(p.get('entry_price')):,.2f}<br><extra></extra>"
+                    f"<b>Open #{idx}</b> — {trig_short}<br>"
+                    f"{trig_long}<br>"
+                    f"Range: [{mn:.0f}, {mx:.0f}]  (width {m['width_pct']:.1f}% of price)<br>"
+                    f"Buffer: ↓{m['lower_buf_pct']:.1f}%   ↑{m['upper_buf_pct']:.1f}%<br>"
+                    f"Entry price: ${float(p.get('entry_price')):,.2f}<br>"
+                    f"Insurance buy: ${_as_float(p.get('insurance_cost_usdc')):,.0f}"
+                    f"  ({(m['ins_pct_of_deposit'] or 0):.2f}% of deposit)"
+                    f"<extra></extra>"
                 )
 
                 close_x.append(_dt_from_iso(str(p["close"])))
@@ -963,6 +1050,103 @@ def make_positions_timeline_figure(positions: List[PositionEvent]) -> go.Figure:
     return fig
 
 
+def make_cumulative_pnl_figure(snaps: Dict[str, List[Any]], summary: Dict[str, Any]) -> go.Figure:
+    """Cumulative USD PnL of the strategy vs HODL, with the per-position
+    insurance net and LP fees broken out as supporting series.
+
+    All curves are zeroed at the first snapshot so the chart shows *change*
+    from initial capital. The per-position insurance and fee series are
+    plotted as cumulative sums anchored at each position close, which is
+    when those cashflows actually realised."""
+    xs = snaps["x"]
+    strat = snaps["strategy_usd"]
+    hodl = snaps["hodl_usd"]
+
+    inv_usd = _as_float(summary.get("investment_usd"))
+    if not inv_usd:
+        # Fallback: anchor at the first finite strategy value.
+        for v in strat:
+            if v:
+                inv_usd = float(v)
+                break
+
+    strat_pnl = [(v - inv_usd) if v is not None else None for v in strat]
+    hodl_pnl = [(v - inv_usd) if v is not None else None for v in hodl]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=xs, y=strat_pnl,
+            name="Strategy PnL (LP + Polymarket)",
+            mode="lines",
+            line=dict(color="rgb(31,119,180)", width=2.5),
+            hovertemplate="%{x|%Y-%m-%d %H:%M}<br>Strategy: $%{y:,.0f}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=xs, y=hodl_pnl,
+            name="HODL PnL (initial 50/50)",
+            mode="lines",
+            line=dict(color="rgb(127,127,127)", width=2, dash="dash"),
+            hovertemplate="%{x|%Y-%m-%d %H:%M}<br>HODL: $%{y:,.0f}<extra></extra>",
+        )
+    )
+
+    # Cumulative LP fees and insurance net, anchored at each position close.
+    positions = summary.get("positions") or []
+    if positions:
+        ins_x: List[Any] = []
+        ins_y: List[float] = []
+        fee_x: List[Any] = []
+        fee_y: List[float] = []
+        ins_cum = 0.0
+        fee_cum = 0.0
+        for p in positions:
+            try:
+                close_dt = _dt_from_iso(str(p["close"]))
+            except Exception:
+                continue
+            ins_cum += _as_float(p.get("insurance_net_usdc"))
+            fee_cum += _as_float(p.get("fees_earned_usd"))
+            ins_x.append(close_dt)
+            ins_y.append(ins_cum)
+            fee_x.append(close_dt)
+            fee_y.append(fee_cum)
+
+        fig.add_trace(
+            go.Scatter(
+                x=ins_x, y=ins_y,
+                name="Cumulative insurance net (cost − payout − sellback)",
+                mode="lines+markers",
+                line=dict(color="rgb(214,39,40)", width=1.5),
+                marker=dict(size=4),
+                hovertemplate="%{x|%Y-%m-%d}<br>Cum insurance net: $%{y:,.0f}<extra></extra>",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=fee_x, y=fee_y,
+                name="Cumulative LP fees earned",
+                mode="lines+markers",
+                line=dict(color="rgb(44,160,44)", width=1.5),
+                marker=dict(size=4),
+                hovertemplate="%{x|%Y-%m-%d}<br>Cum LP fees: $%{y:,.0f}<extra></extra>",
+            )
+        )
+
+    fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="rgba(0,0,0,0.45)")
+    fig.update_layout(
+        title="Cumulative PnL vs HODL — strategy decomposition",
+        legend_orientation="h",
+        margin=dict(l=50, r=20, t=60, b=40),
+        height=420,
+        yaxis_title="USD (vs initial capital)",
+    )
+    _tick_daily_layout(fig)
+    return fig
+
+
 def make_position_bars_figure(positions: List[PositionEvent]) -> go.Figure:
     xs = [f"#{p.idx}" for p in positions]
     il = [p.il_usdc for p in positions]
@@ -995,20 +1179,22 @@ def make_position_bars_figure(positions: List[PositionEvent]) -> go.Figure:
 
 def build_report(summary: Dict[str, Any], title: str) -> go.Figure:
     snaps = parse_snapshots(summary)
-    # 4 rows: balances/cashflows table + price+range chart + rebalance history (EXEC) + rebalance history (MID).
+    # 5 rows: balances + price/range + cumulative PnL + EXEC trade list + MID trade list.
     fig = make_subplots(
-        rows=4,
+        rows=5,
         cols=1,
         shared_xaxes=False,
-        vertical_spacing=0.09,
+        vertical_spacing=0.075,
         subplot_titles=(
             "Balances + Cashflow",
             "Strategy Ranges Over Time",
-            "Rebalance History (EXEC / with premium)",
-            "Rebalance History (MID / no premium)",
+            "Cumulative PnL Decomposition",
+            "Trade List (EXEC / with premium)",
+            "Trade List (MID / no premium)",
         ),
         specs=[
             [{"type": "table"}],
+            [{"type": "xy"}],
             [{"type": "xy"}],
             [{"type": "table"}],
             [{"type": "table"}],
@@ -1023,38 +1209,42 @@ def build_report(summary: Dict[str, Any], title: str) -> go.Figure:
     for tr in pr.data:
         fig.add_trace(tr, row=2, col=1)
 
+    pnl = make_cumulative_pnl_figure(snaps, summary)
+    for tr in pnl.data:
+        fig.add_trace(tr, row=3, col=1)
+
     rtbl = make_rebalances_table(summary)
     for tr in rtbl.data:
-        fig.add_trace(tr, row=3, col=1)
+        fig.add_trace(tr, row=4, col=1)
 
     rtbl_mid = make_rebalances_table_mid(summary)
     for tr in rtbl_mid.data:
-        fig.add_trace(tr, row=4, col=1)
+        fig.add_trace(tr, row=5, col=1)
 
     # Global layout tuning
     fig.update_layout(
         title=None,
-        height=2050,
+        height=2520,
         margin=dict(l=55, r=25, t=100, b=120),
         legend=dict(
             orientation="h",
             x=0.0,
             xanchor="left",
-            # Will be positioned just below the chart row once domains exist.
             y=0.0,
             yanchor="top",
             entrywidthmode="fraction",
             entrywidth=0.20,
         ),
     )
-    # Subplot title spacing (keep tight; layout already has card padding).
     fig.update_annotations(yshift=18)
 
-    # Daily ticks on time-series rows
+    # Daily ticks on the two time-series rows
     fig.update_xaxes(tickformat="%b %d", dtick=7 * 24 * 60 * 60 * 1000, tickangle=-45, row=2, col=1)
+    fig.update_xaxes(tickformat="%b %d", dtick=7 * 24 * 60 * 60 * 1000, tickangle=-45, row=3, col=1)
+    fig.update_yaxes(title_text="USD per ETH", row=2, col=1)
+    fig.update_yaxes(title_text="USD (vs initial capital)", row=3, col=1)
 
-    # Place the legend directly under the chart (row=2), not at the end of the page.
-    # For this report there's a single cartesian y-axis (the chart); tables don't create y-axes.
+    # Place the shared legend just under the price chart (row 2).
     try:
         y0 = float(fig.layout.yaxis.domain[0])
         fig.update_layout(legend=dict(y=y0 - 0.03))
@@ -1077,6 +1267,53 @@ def write_report_html(
     it will never overlap the Plotly table/plots, regardless of viewport size.
     """
     plot_html = fig.to_html(include_plotlyjs="cdn", full_html=False)
+
+    # Counts for the entry-trigger summary
+    positions = summary.get("positions") or []
+    n_pos = len(positions)
+    triggers = {"first open": 0, "rebalance ↓": 0, "rebalance ↑": 0,
+                "hedge expired": 0, "period end": 0, "other": 0}
+    prev_reason = None
+    for i, p in enumerate(positions, start=1):
+        short, _ = _entry_trigger(prev_reason, i)
+        triggers[short if short in triggers else "other"] += 1
+        prev_reason = str(p.get("close_reason") or "")
+    n_first = triggers["first open"]
+    n_rebal_dn = triggers["rebalance ↓"]
+    n_rebal_up = triggers["rebalance ↑"]
+    n_expired = triggers["hedge expired"]
+    n_other = triggers["period end"] + triggers["other"]
+    rm = summary.get("run_metadata") or {}
+    cooldown = rm.get("cooldown_hours", "?")
+
+    explainer = f"""
+      <div class="explainer">
+        <h3 style="margin:0 0 8px 0">How positions are opened</h3>
+        <p style="margin:0 0 8px 0">
+          The simulator runs hourly. With <b>no</b> open position it scans the
+          range universe at the current candle and selects the range with the
+          highest score:
+          <code>narrowness_bonus − insurance_cost_rate</code>, after filtering
+          out (a) ranges that don't contain the current price with at least a
+          5% buffer on each side, and (b) ranges where either Polymarket leg's
+          YES probability is above 20% (a hard cap that biases entries toward
+          out-of-the-money wings). Ties broken by lowest insurance spend.
+        </p>
+        <p style="margin:0 0 8px 0">A new position is opened when one of three things happens:</p>
+        <ul style="margin:0 0 8px 18px; padding:0">
+          <li><b>First open</b> — at the very first usable candle of the backtest window.</li>
+          <li><b>Rebalance ↓ / ↑</b> — the previous LP range was breached on the lower / upper bound; the position is force-closed (next-candle policy) and immediately re-entered after a {cooldown}h cooldown.</li>
+          <li><b>Hedge expired</b> — the Polymarket touch market underwriting the previous position rolled off (its <code>end_date</code> passed); the LP is closed and re-opened against a freshly-listed monthly market with the same (asset, strike) family.</li>
+        </ul>
+        <p style="margin:0">
+          Across the {n_pos} positions in this run:
+          <b>{n_first}</b> first open · <b>{n_rebal_dn}</b> price-driven rebalance ↓ ·
+          <b>{n_rebal_up}</b> price-driven rebalance ↑ · <b>{n_expired}</b> hedge-expiry rollovers ·
+          <b>{n_other}</b> other.
+          See the <i>Why entered</i> column in the trade list and hover any
+          green entry marker on the price chart for the per-trade rationale.
+        </p>
+      </div>"""
 
     html = f"""<!doctype html>
 <html lang="en">
@@ -1115,11 +1352,29 @@ def write_report_html(
       .card .js-plotly-plot {{
         border-radius: 12px;
       }}
+      .explainer {{
+        background: #FFFFFF;
+        border: 1px solid rgba(17,24,39,0.10);
+        border-radius: 14px;
+        padding: 16px 18px;
+        box-shadow: 0 6px 18px rgba(17,24,39,0.06);
+        margin: 0 0 16px 0;
+        line-height: 1.45;
+        font-size: 13.5px;
+      }}
+      .explainer h3 {{ font-size: 14.5px; }}
+      .explainer code {{
+        background: #F3F4F6;
+        padding: 1px 5px;
+        border-radius: 4px;
+        font-size: 12.5px;
+      }}
     </style>
   </head>
   <body>
     <div class="container">
       <div class="page-title">{title}</div>
+      {explainer}
       <div class="card">
         {plot_html}
       </div>

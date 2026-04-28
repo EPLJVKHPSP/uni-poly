@@ -21,12 +21,44 @@ def get_db_connection():
     return psycopg2.connect(**db_config)
 
 
-def get_range_combinations(token_symbol: str, conn=None, candle_ts=None) -> List[Dict]:
+def _resolution_filter_sql(cur, restrict_to_touch: bool) -> str:
+    """Return a SQL fragment restricting to touch-style markets when possible.
+
+    Defensive: if the ``resolution_type`` column doesn't exist (legacy DBs that
+    haven't been re-parsed yet) we silently no-op so that callers keep working.
+    """
+    if not restrict_to_touch:
+        return ""
+    try:
+        cur.execute(
+            """
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'price_events' AND column_name = 'resolution_type'
+            """
+        )
+        if cur.fetchone() is None:
+            return ""
+    except Exception:
+        return ""
+    return " AND (resolution_type IS NULL OR resolution_type = 'touch_any_time') "
+
+
+def get_range_combinations(
+    token_symbol: str,
+    conn=None,
+    candle_ts=None,
+    restrict_to_touch_markets: bool = False,
+) -> List[Dict]:
     """
     Get all range combinations for a given token from Polymarket data.
 
     Extracts all 'down' direction levels (lower bounds) and 'up' direction
     levels (upper bounds), then generates all valid combinations where min < max.
+
+    When ``restrict_to_touch_markets=True``, only markets whose
+    ``resolution_type`` column is ``touch_any_time`` (or NULL for legacy rows)
+    are considered — this is the only resolution rule that geometrically
+    matches an LP's barrier-hit risk.
     """
     if conn is None:
         conn = get_db_connection()
@@ -41,21 +73,23 @@ def get_range_combinations(token_symbol: str, conn=None, candle_ts=None) -> List
 
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            touch_filter = _resolution_filter_sql(cur, restrict_to_touch_markets)
             if candle_ts is None:
                 cur.execute(
-                    """
+                    f"""
                     SELECT DISTINCT ON (level)
                         level, price, market_id, market_question, event_id
                     FROM price_events
                     WHERE underlying = %s AND direction = 'down'
                       AND side = 'Yes' AND active = true
+                      {touch_filter}
                     ORDER BY level, price ASC
                     """,
                     (token_symbol,),
                 )
             else:
                 cur.execute(
-                    """
+                    f"""
                     SELECT DISTINCT ON (level)
                         level, price, market_id, market_question, event_id
                     FROM price_events
@@ -63,6 +97,7 @@ def get_range_combinations(token_symbol: str, conn=None, candle_ts=None) -> List
                       AND side = 'Yes'
                       AND (created_at IS NULL OR created_at <= %s)
                       AND (end_date IS NULL OR end_date >= %s)
+                      {touch_filter}
                     ORDER BY level, price ASC
                     """,
                     (token_symbol, candle_ts, candle_ts),
@@ -71,19 +106,20 @@ def get_range_combinations(token_symbol: str, conn=None, candle_ts=None) -> List
 
             if candle_ts is None:
                 cur.execute(
-                    """
+                    f"""
                     SELECT DISTINCT ON (level)
                         level, price, market_id, market_question, event_id
                     FROM price_events
                     WHERE underlying = %s AND direction = 'up'
                       AND side = 'Yes' AND active = true
+                      {touch_filter}
                     ORDER BY level, price ASC
                     """,
                     (token_symbol,),
                 )
             else:
                 cur.execute(
-                    """
+                    f"""
                     SELECT DISTINCT ON (level)
                         level, price, market_id, market_question, event_id
                     FROM price_events
@@ -91,6 +127,7 @@ def get_range_combinations(token_symbol: str, conn=None, candle_ts=None) -> List
                       AND side = 'Yes'
                       AND (created_at IS NULL OR created_at <= %s)
                       AND (end_date IS NULL OR end_date >= %s)
+                      {touch_filter}
                     ORDER BY level, price ASC
                     """,
                     (token_symbol, candle_ts, candle_ts),
@@ -186,10 +223,17 @@ def get_historical_bet_price(
     clob_token_id: str,
     target_ts,
     conn=None,
+    strict_past: bool = True,
 ) -> Optional[float]:
     """
     Get the bet price at (or closest around) a target timestamp.
     Uses the bet_price_history table populated by polymarket_history.py.
+
+    When ``strict_past=True`` (the default) only rows with ``ts <= target_ts``
+    are considered, returning None if none exist. This is the no-lookahead
+    semantics required by the simulator. Pass ``strict_past=False`` to allow
+    falling back to the closest *future* row (only useful for ad-hoc lookups
+    or for filling gaps after a backtest run).
     """
     from datetime import datetime, timezone as tz
 
@@ -217,6 +261,9 @@ def get_historical_bet_price(
             row = cur.fetchone()
             if row:
                 return float(row[0])
+
+            if strict_past:
+                return None
 
             cur.execute(
                 """

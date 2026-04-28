@@ -119,8 +119,12 @@ def pick_best_range(
     if not scored:
         return None
 
-    # Hard cap: don't choose ranges where either side has >10% implied probability.
-    # We interpret Polymarket YES price as the probability proxy.
+    # Hard cap: don't choose ranges where either side has > ``cap`` implied
+    # probability (Polymarket YES price is used as the probability proxy).
+    # NOTE: this cap *selects against* high-EV insurance trades — if the market
+    # is efficient then E[hedge] ≈ 0 and the cap just biases us toward the
+    # cheapest, most-out-of-the-money wings. It is kept for now to preserve
+    # behaviour but should ideally be replaced by a dollar-EV objective.
     cap = 0.20
     scored = [
         s for s in scored

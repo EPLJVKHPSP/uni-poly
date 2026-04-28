@@ -11,3 +11,12 @@ from .sync import (  # noqa: F401
     upsert_price_history,
     sync_all_markets,
 )
+
+from .trades_sync import (  # noqa: F401
+    DATA_API_BASE,
+    PAGE_LIMIT,
+    ensure_trades_table,
+    fetch_all_trades,
+    upsert_trades,
+    sync_all_trades,
+)

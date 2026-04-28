@@ -26,7 +26,12 @@ from .range_selection import (
     _get_insurance_for_range,
 )
 from .positions import open_position, close_position
-from .polymarket_execution import ClosePolicy, SlippageConfig, choose_close_price
+from .polymarket_execution import (
+    ClosePolicy,
+    PolymarketFeeModel,
+    SlippageConfig,
+    choose_close_price,
+)
 from .telemetry import TelemetrySink, new_run_id
 
 logger = logging.getLogger(__name__)
@@ -40,6 +45,151 @@ def _get_db_func(name):
         return getattr(shim, name)
     import db_utils
     return getattr(db_utils, name)
+
+
+def _build_outcome_to_market_index(
+    *,
+    fills_glob: str,
+    markets_path: str,
+) -> Dict[str, Tuple[str, str]]:
+    """Map each Polymarket ``outcome_platform_id`` (a.k.a. CLOB token id) to
+    its parent ``(market_platform_id, outcome_name)`` so the book lookup can
+    resolve a hedge leg's clob_token_id to the right Probalytics ladder.
+
+    Strategy:
+      1. Prefer the local fills parquet (each row carries both ids + name).
+      2. Fall back to the markets parquet's ``outcomes`` column (a list of
+         dicts ``{"platform_id": ..., "name": ...}``).
+    """
+    import glob
+    import pandas as pd
+
+    out: Dict[str, Tuple[str, str]] = {}
+    fills_paths = sorted(glob.glob(fills_glob))
+    for p in fills_paths:
+        try:
+            df = pd.read_parquet(p, columns=["market_platform_id", "outcome_platform_id", "outcome_name"])
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        df = df.dropna(subset=["outcome_platform_id"]).drop_duplicates(subset=["outcome_platform_id"])
+        for row in df.itertuples(index=False):
+            opid = str(row.outcome_platform_id)
+            if opid not in out:
+                out[opid] = (str(row.market_platform_id), str(row.outcome_name))
+
+    if os.path.exists(markets_path):
+        try:
+            mdf = pd.read_parquet(markets_path, columns=["market_platform_id", "outcomes"])
+            for row in mdf.itertuples(index=False):
+                outcomes = row.outcomes
+                if outcomes is None:
+                    continue
+                for o in outcomes:
+                    if isinstance(o, dict):
+                        opid = o.get("platform_id")
+                        name = o.get("name")
+                    else:
+                        try:
+                            opid = o[1]
+                            name = o[2]
+                        except Exception:
+                            continue
+                    if opid and str(opid) not in out:
+                        out[str(opid)] = (str(row.market_platform_id), str(name or "Yes"))
+        except Exception:
+            pass
+    return out
+
+
+def _build_strike_date_index(markets_path: str):
+    """Build a (asset, strike_int) -> list of (market_platform_id, opened_at,
+    closes_at, outcome_name_yes) records from Probalytics multi-strike
+    "will-X-reach-Y-on-DATE" + binary "X-above-Y-on-DATE" markets, used as a
+    fallback when a backtester-chosen monthly market isn't in Probalytics.
+
+    Returns ``({}, lambda key, ts: None)`` if the markets parquet is missing
+    or empty so callers can no-op.
+    """
+    import re
+    import pandas as pd
+
+    if not os.path.exists(markets_path):
+        return {}, (lambda asset, strike, ts_int: None)
+
+    try:
+        mdf = pd.read_parquet(markets_path, columns=["market_platform_id", "slug", "outcomes", "opened_at", "closes_at"])
+    except Exception:
+        return {}, (lambda asset, strike, ts_int: None)
+
+    # asset slug -> normalized name
+    def _asset_of(slug: str) -> Optional[str]:
+        s = (slug or "").lower()
+        if s.startswith("ethereum-above-") or s.startswith("will-ethereum-reach-") or s.startswith("will-eth-reach-"):
+            return "ETH"
+        if s.startswith("bitcoin-above-") or s.startswith("will-bitcoin-reach-") or s.startswith("will-btc-reach-"):
+            return "BTC"
+        return None
+
+    _STRIKE_RE_ABOVE = re.compile(r"-above-(\d+(?:k)?)-")
+    _STRIKE_RE_REACH = re.compile(r"-reach-(\d+(?:[.,]\d+)?(?:k)?)-")
+
+    def _strike_of(slug: str) -> Optional[int]:
+        s = (slug or "").lower()
+        m = _STRIKE_RE_ABOVE.search(s) or _STRIKE_RE_REACH.search(s)
+        if not m:
+            return None
+        raw = m.group(1).replace(",", "")
+        if raw.endswith("k"):
+            try:
+                return int(float(raw[:-1]) * 1000)
+            except ValueError:
+                return None
+        try:
+            return int(float(raw))
+        except ValueError:
+            return None
+
+    def _yes_outcome(outcomes) -> Optional[str]:
+        if outcomes is None:
+            return None
+        for o in outcomes:
+            name = o.get("name") if isinstance(o, dict) else (o[2] if len(o) > 2 else None)
+            if isinstance(name, str) and name.strip().lower() == "yes":
+                return name
+        return None
+
+    idx: Dict[Tuple[str, int], List[Tuple[str, int, int, str]]] = {}
+    for row in mdf.itertuples(index=False):
+        asset = _asset_of(row.slug)
+        strike = _strike_of(row.slug)
+        if not asset or strike is None:
+            continue
+        yes = _yes_outcome(row.outcomes) or "Yes"
+        try:
+            opened = int(pd.Timestamp(row.opened_at).timestamp()) if row.opened_at is not None else 0
+            closes = int(pd.Timestamp(row.closes_at).timestamp()) if row.closes_at is not None else 2 ** 31 - 1
+        except Exception:
+            opened, closes = 0, 2 ** 31 - 1
+        idx.setdefault((asset, strike), []).append((str(row.market_platform_id), opened, closes, yes))
+
+    for k in idx:
+        idx[k].sort(key=lambda r: r[1])
+
+    def _lookup(asset: str, strike: int, ts_int: int) -> Optional[Tuple[str, str]]:
+        bucket = idx.get((asset, int(strike)))
+        if not bucket:
+            return None
+        # Prefer the market whose [opened, closes] window contains ts.
+        for mpid, opened, closes, yes in bucket:
+            if opened <= ts_int <= closes:
+                return (mpid, yes)
+        # Else nearest by midpoint (markets adjacent to the trade).
+        nearest = min(bucket, key=lambda r: abs(((r[1] + r[2]) // 2) - ts_int))
+        return (nearest[0], nearest[3])
+
+    return idx, _lookup
 
 
 def simulate(
@@ -62,6 +212,11 @@ def simulate(
     telemetry: Optional[TelemetrySink] = None,
     initial_eth: Optional[float] = None,
     initial_usdc: Optional[float] = None,
+    touch_settlement_haircut: float = 0.0,
+    sell_touched_at_market: bool = False,
+    restrict_to_touch_markets: bool = False,
+    polymarket_fee_category: str = "crypto",
+    polymarket_fees_enabled: bool = True,
 ) -> Tuple[List[Dict], Dict]:
     """
     Walk through hourly candles with realistic wallet tracking.
@@ -78,7 +233,9 @@ def simulate(
     # Range combinations depend on which Polymarket markets were active at a given time.
     # For historical backtests we should query combinations "as-of" the candle timestamp.
     # We keep an initial snapshot for early fallbacks, but selection will refresh per-open.
-    all_combos = get_range_combinations(token_symbol, conn) if conn is not None else []
+    all_combos = get_range_combinations(
+        token_symbol, conn, restrict_to_touch_markets=restrict_to_touch_markets
+    ) if conn is not None else []
 
     warmup_len = len(warmup_candles) if warmup_candles else 0
 
@@ -95,10 +252,144 @@ def simulate(
     baseline_initial_eth = 0.0
     initial_notional_usd: Optional[float] = None
 
+    per_asset_slippage: Dict[str, float] = {}
+    if conn is not None:
+        try:
+            from .slippage_fit import fit_all_assets
+
+            per_asset_slippage = fit_all_assets(conn, asset_ids=None,
+                                                 fallback_per_1k=float(slippage_per_1k_contracts or 0.0))
+        except Exception as exc:
+            logger.warning("Per-asset slippage fit unavailable (%s); using flat per_1k_contracts.", exc)
+
+    # Layer Probalytics-derived slippage on top: when both sources have a
+    # value for the same outcome (clob_token_id), Probalytics wins because
+    # it has taker-side + dispersion data data-api/trades lacks.
+    try:
+        from probalytics_pkg.slippage_fit import (
+            load_fills as _pb_load_fills,
+            fit_per_asset_slippage as _pb_fit,
+        )
+        pb_fills = _pb_load_fills()
+        if not pb_fills.empty:
+            pb_fit = _pb_fit(
+                pb_fills,
+                fallback_per_1k=float(slippage_per_1k_contracts or 0.02),
+            )
+            overrides = sum(1 for k in pb_fit if k in per_asset_slippage)
+            adds = sum(1 for k in pb_fit if k not in per_asset_slippage)
+            per_asset_slippage = {**per_asset_slippage, **pb_fit}
+            logger.info(
+                "Probalytics slippage fit applied: %d outcomes (%d overrides, %d new)",
+                len(pb_fit), overrides, adds,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Probalytics slippage fit unavailable (%s); using bet_trades fit only.", exc)
+
     slippage_cfg = SlippageConfig(
         per_1k_contracts=float(slippage_per_1k_contracts or 0.0),
         max_per_contract=float(slippage_max_per_contract or 0.0),
+        per_asset=per_asset_slippage,
     )
+
+    fee_model = PolymarketFeeModel.for_category(polymarket_fee_category)
+    if not polymarket_fees_enabled:
+        fee_model = PolymarketFeeModel(
+            category=fee_model.category,
+            fee_rate=fee_model.fee_rate,
+            exponent=fee_model.exponent,
+            enabled=False,
+        )
+
+    # Build optional Probalytics on-demand orderbook lookup. When credentials
+    # and the local fills cache are present we resolve each clob_token_id
+    # (== Polymarket outcome platform_id) to its parent market_platform_id and
+    # outcome name, then have apply_execution_costs walk the actual L2 ladder
+    # at trade time. Falls back transparently to the parametric (spread +
+    # fitted slippage) path on any error or cache miss.
+    #
+    # Two resolution layers:
+    #   1. Direct: outcome_platform_id -> Probalytics market (exact match;
+    #      works only when the backtester picks a market Probalytics tracks).
+    #   2. Strike+date proxy: when the chosen monthly multi-strike market
+    #      isn't in Probalytics' coverage, fall back to the Probalytics
+    #      "will-X-reach-<STRIKE>-on-DATE" weekly market with the same asset
+    #      + strike whose lifetime contains the trade timestamp. Same
+    #      economic exposure (touch on the same strike), so the L2 quote is a
+    #      good proxy for execution cost.
+    book_lookup = None
+    book_fetcher = None
+    try:
+        from probalytics_pkg.client import load_creds_from_env, ProbalyticsRest
+        from probalytics_pkg.ondemand import OrderBookFetcher
+
+        creds = load_creds_from_env()
+        rest = ProbalyticsRest(creds)
+        root = os.environ.get("PROBALYTICS_DATA_ROOT", "data/probalytics")
+        outcome_to_market: Dict[str, Tuple[str, str]] = {}
+        strike_lookup = None
+        try:
+            outcome_to_market = _build_outcome_to_market_index(
+                fills_glob=os.path.join(root, "fills", "*.parquet"),
+                markets_path=os.path.join(root, "markets.parquet"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to build outcome->market index for book lookup: %s", exc)
+            outcome_to_market = {}
+        try:
+            _strike_idx, strike_lookup = _build_strike_date_index(
+                markets_path=os.path.join(root, "markets.parquet"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to build strike+date index for book lookup: %s", exc)
+            strike_lookup = None
+            _strike_idx = {}
+
+        if outcome_to_market or _strike_idx:
+            book_fetcher = OrderBookFetcher(rest=rest, root=root)
+
+            # Per-leg metadata is published into these dicts by the simulate
+            # loop right before each open/close, keyed by clob_token_id, so
+            # the strike-date proxy fallback knows what to look up.
+            book_meta: Dict[str, Tuple[str, int]] = {}
+
+            def _resolve(clob_id: str, ts_int: int) -> Optional[Tuple[str, str]]:
+                m = outcome_to_market.get(str(clob_id))
+                if m:
+                    return m
+                meta = book_meta.get(str(clob_id))
+                if meta and strike_lookup is not None:
+                    asset, strike = meta
+                    return strike_lookup(asset, strike, int(ts_int))
+                return None
+
+            def _book_lookup(clob_id, ts_int):
+                resolved = _resolve(str(clob_id), int(ts_int))
+                if not resolved:
+                    return None
+                market_pid, outcome_name = resolved
+                replay = book_fetcher.get(market_pid, datetime.fromtimestamp(int(ts_int), tz=timezone.utc))
+                if replay is None:
+                    return None
+                snap = replay.snapshot_at(
+                    datetime.fromtimestamp(int(ts_int), tz=timezone.utc),
+                    outcome=outcome_name,
+                )
+                if snap is None:
+                    return None
+                return (snap.bids, snap.asks)
+
+            book_lookup = _book_lookup
+            logger.info(
+                "On-demand orderbook fetcher armed: %d direct mappings, %d (asset,strike) buckets, root=%s",
+                len(outcome_to_market), len(_strike_idx), root,
+            )
+        else:
+            book_meta = {}
+            logger.info("On-demand orderbook fetcher disabled (no mappings).")
+    except Exception as exc:  # noqa: BLE001
+        book_meta = {}
+        logger.info("On-demand orderbook fetcher disabled (%s); using parametric slippage only.", exc)
 
     positions: List[Dict] = []
     snapshots: List[Dict] = []
@@ -268,6 +559,10 @@ def simulate(
                 spread=spread,
                 slippage_cfg=slippage_cfg,
                 close_price_override=close_px,
+                touch_settlement_haircut=touch_settlement_haircut,
+                sell_touched_at_market=sell_touched_at_market,
+                fee_model=fee_model,
+                book_lookup=book_lookup,
             )
             positions.append(current_pos)
             pending_close = None
@@ -359,7 +654,10 @@ def simulate(
                     # Fallback: use the static bet prices from the range combinations table
                     # (same source used by heuristic selection), when historical mids are missing.
                     # Important: query combinations "as-of" this candle timestamp (markets rotate).
-                    combos_at_ts = get_range_combinations(token_symbol, conn, candle_ts=ts) if conn is not None else []
+                    combos_at_ts = get_range_combinations(
+                        token_symbol, conn, candle_ts=ts,
+                        restrict_to_touch_markets=restrict_to_touch_markets,
+                    ) if conn is not None else []
                     match = None
                     mn_key = round(float(mn), 2)
                     mx_key = round(float(mx), 2)
@@ -389,7 +687,16 @@ def simulate(
                     token_symbol, investment, conn,
                     price_token=price_token, cooldown_hours=cooldown_hours,
                     candle_ts=ts,
-                    simulate_fn=(lambda *a, **kw: simulate(*a, **kw, initial_eth=initial_eth, initial_usdc=initial_usdc)),
+                    simulate_fn=(lambda *a, **kw: simulate(
+                        *a, **kw,
+                        initial_eth=initial_eth,
+                        initial_usdc=initial_usdc,
+                        touch_settlement_haircut=touch_settlement_haircut,
+                        sell_touched_at_market=sell_touched_at_market,
+                        restrict_to_touch_markets=restrict_to_touch_markets,
+                        polymarket_fee_category=polymarket_fee_category,
+                        polymarket_fees_enabled=polymarket_fees_enabled,
+                    )),
                 )
                 if range_info is None:
                     _snap(ts, current_price, current_pos, wallet)
@@ -400,7 +707,10 @@ def simulate(
                 range_method = "lookback"
                 sweep_score = range_info.get("sweep_score")
             else:
-                combos_at_ts = get_range_combinations(token_symbol, conn, candle_ts=ts) if conn is not None else all_combos
+                combos_at_ts = get_range_combinations(
+                    token_symbol, conn, candle_ts=ts,
+                    restrict_to_touch_markets=restrict_to_touch_markets,
+                ) if conn is not None else all_combos
                 range_info = pick_best_range(combos_at_ts, current_price, token_symbol, ts, investment, conn)
                 if range_info is None:
                     _snap(ts, current_price, current_pos, wallet)
@@ -426,24 +736,9 @@ def simulate(
                 baseline_ready = True
                 initial_notional_usd = baseline_initial_usdc + baseline_initial_eth * float(current_price)
 
-            current_pos = open_position(
-                candle,
-                pool_data,
-                mn,
-                mx,
-                wallet,
-                insurance_info,
-                price_token,
-                gas_prices=gas_prices,
-                spread=spread,
-                slippage_cfg=slippage_cfg,
-            )
-            if current_pos is None:
-                _snap(ts, current_price, current_pos, wallet)
-                i += 1
-                continue
-
-            # Pick Polymarket markets (and expiries) for this position.
+            # Resolve Polymarket markets (and expiries) for this position
+            # *before* opening so that per-asset slippage and the book
+            # lookup (when armed) actually fire on the buy leg.
             lower_meta = None
             upper_meta = None
             if conn is not None:
@@ -472,10 +767,40 @@ def simulate(
                 get_clob_token_id(token_symbol, mx, "up", "Yes", conn, candle_ts=ts) if conn else None
             )
 
-            current_pos["lower_clob_token_id"] = lower_clob_id
-            current_pos["upper_clob_token_id"] = upper_clob_id
-            current_pos["lower_end_ts"] = _end_ts(lower_meta)
-            current_pos["upper_end_ts"] = _end_ts(upper_meta)
+            # Publish (asset, strike) into the shared book_meta dict so the
+            # strike-date proxy fallback inside book_lookup can resolve a
+            # clob_token_id we never directly indexed (i.e. the monthly
+            # multi-strike markets the backtester picks).
+            try:
+                if lower_clob_id is not None:
+                    book_meta[str(lower_clob_id)] = (token_symbol, int(round(float(mn))))
+                if upper_clob_id is not None:
+                    book_meta[str(upper_clob_id)] = (token_symbol, int(round(float(mx))))
+            except Exception:
+                pass
+
+            current_pos = open_position(
+                candle,
+                pool_data,
+                mn,
+                mx,
+                wallet,
+                insurance_info,
+                price_token,
+                gas_prices=gas_prices,
+                spread=spread,
+                slippage_cfg=slippage_cfg,
+                lower_clob_token_id=lower_clob_id,
+                upper_clob_token_id=upper_clob_id,
+                lower_end_ts=_end_ts(lower_meta),
+                upper_end_ts=_end_ts(upper_meta),
+                fee_model=fee_model,
+                book_lookup=book_lookup,
+            )
+            if current_pos is None:
+                _snap(ts, current_price, current_pos, wallet)
+                i += 1
+                continue
 
             wb = current_pos['wallet_before']
             method_tag = f" ({range_method})" if range_method else ""
@@ -562,6 +887,8 @@ def simulate(
                 slippage_cfg=slippage_cfg,
                 close_price_override=current_price,
                 expired=True,
+                fee_model=fee_model,
+                book_lookup=book_lookup,
             )
             positions.append(current_pos)
             wa = current_pos["wallet_after"]
@@ -614,6 +941,10 @@ def simulate(
                 spread=spread,
                 slippage_cfg=slippage_cfg,
                 close_price_override=close_px,
+                touch_settlement_haircut=touch_settlement_haircut,
+                sell_touched_at_market=sell_touched_at_market,
+                fee_model=fee_model,
+                book_lookup=book_lookup,
             )
             positions.append(current_pos)
 
@@ -696,6 +1027,10 @@ def simulate(
             current_pos, candles[-1], False, False,
             price_token, token_symbol, conn, gas_prices=gas_prices, spread=spread,
             slippage_cfg=slippage_cfg,
+            touch_settlement_haircut=touch_settlement_haircut,
+            sell_touched_at_market=sell_touched_at_market,
+            fee_model=fee_model,
+            book_lookup=book_lookup,
         )
         positions.append(current_pos)
         sb = current_pos.get('insurance_sellback', 0)
@@ -760,6 +1095,17 @@ def simulate(
             },
         )
 
+    if book_fetcher is not None:
+        st = book_fetcher.stats()
+        n_book_open = sum(1 for p in positions if p.get("book_used_open"))
+        n_book_close = sum(1 for p in positions if p.get("book_used_close"))
+        logger.info(
+            "Orderbook coverage: opens_book=%d/%d closes_book=%d/%d  "
+            "fetcher hits=%d misses=%d empty=%d errors=%d",
+            n_book_open, len(positions), n_book_close, len(positions),
+            st["cache_hits"], st["cache_misses"], st["empty_responses"], st["errors"],
+        )
+
     return positions, wallet, snapshots
 
 
@@ -774,6 +1120,7 @@ def build_summary(
     snapshots: Optional[List[Dict]] = None,
     data_quality: Optional[Dict] = None,
     run_metadata: Optional[Dict] = None,
+    risk_free_rate_apy: float = 0.0,
 ) -> Dict:
     start_ts = int(candles[0]["periodStartUnix"])
     end_ts = int(candles[-1]["periodStartUnix"])
@@ -795,6 +1142,49 @@ def build_summary(
     total_gas_fees = sum(p.get("gas_fee_open", 0) + p.get("gas_fee_close", 0) for p in positions)
     total_spread_cost = sum(p.get("spread_cost_buy", 0) + p.get("spread_cost_sell", 0) for p in positions)
     total_slippage_cost = sum(p.get("slippage_cost_buy", 0) + p.get("slippage_cost_sell", 0) for p in positions)
+    total_polymarket_fees = sum(
+        p.get("polymarket_fee_buy", 0.0) + p.get("polymarket_fee_sell", 0.0) for p in positions
+    )
+
+    # ---- Opportunity cost on capital that is NOT earning the risk-free rate ----
+    # Two forgone-yield buckets:
+    #   (a) Polymarket capital: USDC locked in YES contracts pays no interest;
+    #       a treasury would have earned ``insurance_cost * duration_days * rfr``.
+    #   (b) Idle wallet: between positions, the wallet sits in USDC/ETH; the USDC
+    #       leg could be in a money-market fund instead. Use snapshot-derived
+    #       hourly idle USDC (when ``current_pos`` is None in the simulator the
+    #       snapshot's ``strategy_usd`` equals the wallet value, so we read it
+    #       directly).
+    rfr = max(float(risk_free_rate_apy or 0.0), 0.0)
+    poly_opp_cost = 0.0
+    idle_opp_cost = 0.0
+    if rfr > 0.0:
+        for p in positions:
+            dur_yrs = max(float(p.get("duration_hours") or 0.0), 0.0) / (24.0 * 365.0)
+            poly_opp_cost += float(p.get("insurance_cost", 0.0)) * dur_yrs * rfr
+        # Idle wallet: integrate hourly snapshots that are *between* positions.
+        # snapshot["strategy_usd"] == wallet value when no position is open.
+        if snapshots:
+            in_position_intervals = [
+                (int(p["open_ts"]), int(p["close_ts"])) for p in positions
+            ]
+            # Sort once; cheap O(n log n).
+            in_position_intervals.sort()
+            j = 0
+            for snap in snapshots:
+                ts = int(snap["ts"])
+                # Advance j past intervals that ended at or before ts.
+                while j < len(in_position_intervals) and in_position_intervals[j][1] <= ts:
+                    j += 1
+                inside = (
+                    j < len(in_position_intervals)
+                    and in_position_intervals[j][0] <= ts < in_position_intervals[j][1]
+                )
+                if inside:
+                    continue
+                # 1 hour of idle capital = strategy_usd / (24*365) yrs.
+                idle_opp_cost += float(snap.get("strategy_usd", 0.0)) * (1.0 / (24.0 * 365.0)) * rfr
+    total_opportunity_cost = poly_opp_cost + idle_opp_cost
 
     boundary_closes = sum(1 for p in positions if p.get("touched_lower") or p.get("touched_upper"))
     lower_touches = sum(1 for p in positions if p.get("touched_lower"))
@@ -860,6 +1250,12 @@ def build_summary(
             "spread_cost_sell_usdc": round(p.get("spread_cost_sell", 0), 2),
             "slippage_cost_buy_usdc": round(p.get("slippage_cost_buy", 0), 2),
             "slippage_cost_sell_usdc": round(p.get("slippage_cost_sell", 0), 2),
+            "polymarket_fee_buy_usdc": round(p.get("polymarket_fee_buy", 0.0), 4),
+            "polymarket_fee_sell_usdc": round(p.get("polymarket_fee_sell", 0.0), 4),
+            "polymarket_fee_total_usdc": round(
+                p.get("polymarket_fee_buy", 0.0) + p.get("polymarket_fee_sell", 0.0),
+                4,
+            ),
             "insurance_cost_usdc": round(p["insurance_cost"], 2),
             "insurance_payout_usdc": round(p["insurance_payout"], 2),
             "insurance_sellback_usdc": round(p.get("insurance_sellback", 0), 2),
@@ -967,6 +1363,19 @@ def build_summary(
             "total_gas_fees_usdc": round(total_gas_fees, 2),
             "total_spread_cost_usdc": round(total_spread_cost, 2),
             "total_slippage_cost_usdc": round(total_slippage_cost, 2),
+            "total_polymarket_taker_fees_usdc": round(total_polymarket_fees, 4),
+            "opportunity_cost": {
+                "risk_free_rate_apy": round(rfr, 4),
+                "polymarket_capital_usdc": round(poly_opp_cost, 2),
+                "idle_wallet_usdc": round(idle_opp_cost, 2),
+                "total_usdc": round(total_opportunity_cost, 2),
+                "note": "Forgone risk-free yield on Polymarket-locked capital and wallet cash between positions. Subtracted from ROI/APY in the *_net_of_opp_cost fields below.",
+            },
+            "roi_pct_net_of_opp_cost": round(
+                (final_total_value / cost_basis - 1) * 100 - (total_opportunity_cost / cost_basis * 100)
+                if cost_basis else 0.0,
+                2,
+            ),
             "total_insurance_cost_usdc": round(total_ins_cost, 2), "total_insurance_payout_usdc": round(total_ins_payout, 2),
             "total_insurance_sellback_usdc": round(total_ins_sellback, 2), "total_insurance_net_usdc": round(total_ins_net, 2),
             "lp_final_value_usd": round(final_value, 2),
@@ -1060,12 +1469,18 @@ def run_sweep(
     gas_prices: Optional[Dict[str, int]] = None,
     spread: float = 0.0,
     slippage_cfg: Optional[SlippageConfig] = None,
+    restrict_to_touch_markets: bool = False,
+    polymarket_fee_category: str = "crypto",
+    polymarket_fees_enabled: bool = True,
 ) -> List[Dict]:
     """Run simulation for every valid Polymarket range combo, return ranked results."""
     get_range_combinations = _get_db_func("get_range_combinations")
     first_ts = int(candles[0]["periodStartUnix"])
     # Use markets valid at the backtest start timestamp (not only today's active markets).
-    all_combos = get_range_combinations(token_symbol, conn, candle_ts=first_ts)
+    all_combos = get_range_combinations(
+        token_symbol, conn, candle_ts=first_ts,
+        restrict_to_touch_markets=restrict_to_touch_markets,
+    )
     if not all_combos:
         raise ValueError(f"No Polymarket range combinations found for {token_symbol}")
 
@@ -1109,6 +1524,9 @@ def run_sweep(
                 slippage_max_per_contract=sl_max,
                 initial_eth=initial_eth,
                 initial_usdc=initial_usdc,
+                restrict_to_touch_markets=restrict_to_touch_markets,
+                polymarket_fee_category=polymarket_fee_category,
+                polymarket_fees_enabled=polymarket_fees_enabled,
             )
         except Exception as exc:
             sweep_errors += 1
@@ -1204,7 +1622,16 @@ def main():
     spread = float(bt.get("spread", 0.04) or 0.0)
     slippage_per_1k = float(bt.get("slippage_per_1k_contracts", 0.0) or 0.0)
     slippage_max = float(bt.get("slippage_max_per_contract", 0.0) or 0.0)
-    close_policy: ClosePolicy = str(bt.get("close_policy", "touch"))  # type: ignore[assignment]
+    close_policy: ClosePolicy = str(bt.get("close_policy", "pessimistic"))  # type: ignore[assignment]
+    touch_settlement_haircut = float(bt.get("touch_settlement_haircut", 0.03) or 0.0)
+    sell_touched_at_market = bool(bt.get("sell_touched_at_market", True))
+    risk_free_rate_apy = float(bt.get("risk_free_rate_apy", 0.045) or 0.0)
+    perp_funding_rate_apy = float(bt.get("perp_funding_rate_apy", 0.10) or 0.0)
+    gas_strict = bool(bt.get("gas_strict", True))
+    priority_fee_gwei = float(bt.get("priority_fee_gwei", 2.0) or 0.0)
+    restrict_to_touch_markets = bool(bt.get("restrict_to_touch_markets", True))
+    polymarket_fee_category = str(bt.get("polymarket_fee_category", "crypto") or "crypto").lower()
+    polymarket_fees_enabled = bool(bt.get("polymarket_fees_enabled", True))
     # External-cost accounting is always ON (no config flag).
 
     telemetry_cfg = bt.get("telemetry") or {}
@@ -1229,6 +1656,11 @@ def main():
     end_date_str = now.strftime("%Y-%m-%d")
     logger.info("Fetching historical gas prices via RPC block sampling...")
     gas_prices = fetch_daily_gas_prices(start_date_str, end_date_str)
+    # Inject priority fee + strict-mode preferences so downstream gas_cost_usd
+    # calls behave consistently without having to thread two extra params.
+    if isinstance(gas_prices, dict):
+        gas_prices["__priority_fee_gwei__"] = priority_fee_gwei
+        gas_prices["__strict__"] = bool(gas_strict)
 
     logger.info(f"Fetching {total_fetch_days} days of hourly candles ({days}d backtest + {lookback_days}d lookback)...")
     all_candles = fetch_hourly_candles(pool, start_ts, end_ts)
@@ -1292,6 +1724,9 @@ def main():
                 gas_prices=gas_prices,
                 spread=spread,
                 slippage_cfg=SlippageConfig(per_1k_contracts=slippage_per_1k, max_per_contract=slippage_max),
+                restrict_to_touch_markets=restrict_to_touch_markets,
+                polymarket_fee_category=polymarket_fee_category,
+                polymarket_fees_enabled=polymarket_fees_enabled,
             )
 
             sweep_out = (
@@ -1339,6 +1774,11 @@ def main():
                 telemetry=None,
                 initial_eth=initial_eth,
                 initial_usdc=float(initial_usdc) if initial_usdc is not None else None,
+                touch_settlement_haircut=touch_settlement_haircut,
+                sell_touched_at_market=sell_touched_at_market,
+                restrict_to_touch_markets=restrict_to_touch_markets,
+                polymarket_fee_category=polymarket_fee_category,
+                polymarket_fees_enabled=polymarket_fees_enabled,
             )
 
             poly_report = validate_polymarket_coverage(hourly_snapshots)
@@ -1359,6 +1799,8 @@ def main():
                 "slippage_per_1k_contracts": slippage_per_1k,
                 "slippage_max_per_contract": slippage_max,
                 "close_policy": close_policy,
+                "polymarket_fee_category": polymarket_fee_category,
+                "polymarket_fees_enabled": polymarket_fees_enabled,
                 "selection_mode": "sweep",
                 "capital_model": "eth_first",
                 "initial_eth": float(initial_eth),
@@ -1374,6 +1816,7 @@ def main():
                 snapshots=hourly_snapshots,
                 data_quality=data_quality,
                 run_metadata=run_metadata,
+                risk_free_rate_apy=risk_free_rate_apy,
             )
             with open(output_path, "w") as f:
                 json.dump(summary, f, indent=2)
@@ -1403,6 +1846,11 @@ def main():
                 telemetry=telemetry,
                 initial_eth=initial_eth,
                 initial_usdc=float(initial_usdc) if initial_usdc is not None else None,
+                touch_settlement_haircut=touch_settlement_haircut,
+                sell_touched_at_market=sell_touched_at_market,
+                restrict_to_touch_markets=restrict_to_touch_markets,
+                polymarket_fee_category=polymarket_fee_category,
+                polymarket_fees_enabled=polymarket_fees_enabled,
             )
             poly_report = validate_polymarket_coverage(hourly_snapshots)
             if poly_report.position_hours and (
@@ -1466,6 +1914,8 @@ def main():
                 "slippage_per_1k_contracts": slippage_per_1k,
                 "slippage_max_per_contract": slippage_max,
                 "close_policy": close_policy,
+                "polymarket_fee_category": polymarket_fee_category,
+                "polymarket_fees_enabled": polymarket_fees_enabled,
                 "selection_mode": "lookback" if warmup_candles else ("fixed" if fixed_range else "heuristic"),
                 "capital_model": "eth_first",
                 "initial_eth": float(initial_eth),
@@ -1480,6 +1930,7 @@ def main():
                 snapshots=hourly_snapshots,
                 data_quality=data_quality,
                 run_metadata=run_metadata,
+                risk_free_rate_apy=risk_free_rate_apy,
             )
             with open(output_path, "w") as f:
                 json.dump(summary, f, indent=2)

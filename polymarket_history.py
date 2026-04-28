@@ -43,10 +43,18 @@ def get_db_connection():
     )
 
 
-def sync_all_markets(fidelity=60):
+def sync_all_markets(
+    fidelity=60,
+    resolution_types=("touch_any_time",),
+    underlyings=None,
+    sleep_s: float = 0.3,
+):
     """
     For every market in price_events that has a clob_token_id,
     fetch historical prices and store them in bet_price_history.
+
+    By default we restrict to ``touch_any_time`` markets (the IL-hedge
+    instruments). Pass ``resolution_types=None`` to sync every market.
     """
     conn = get_db_connection()
     try:
@@ -54,16 +62,30 @@ def sync_all_markets(fidelity=60):
         ensure_history_table(cur)
         conn.commit()
 
+        clauses = ["clob_token_id IS NOT NULL"]
+        params: list = []
+        if resolution_types:
+            clauses.append("resolution_type = ANY(%s)")
+            params.append(list(resolution_types))
+        if underlyings:
+            clauses.append("underlying = ANY(%s)")
+            params.append(list(underlyings))
+        where = " AND ".join(clauses)
+
         cur.execute(
-            """
+            f"""
             SELECT DISTINCT clob_token_id, market_id, side, underlying, level, direction, active, closed_time
             FROM price_events
-            WHERE clob_token_id IS NOT NULL
+            WHERE {where}
             ORDER BY underlying, level
-            """
+            """,
+            params,
         )
         markets = cur.fetchall()
-        logger.info(f"Found {len(markets)} markets with CLOB token IDs")
+        logger.info(
+            f"Found {len(markets)} markets with CLOB token IDs "
+            f"(resolution_types={resolution_types}, underlyings={underlyings})"
+        )
 
         total_points = 0
         for i, row in enumerate(markets, 1):
@@ -87,7 +109,7 @@ def sync_all_markets(fidelity=60):
 
             conn.commit()
 
-            time.sleep(0.3)
+            time.sleep(sleep_s)
 
         logger.info(f"\nDone. Total price points stored: {total_points}")
     finally:
@@ -98,11 +120,16 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Sync Polymarket historical bet prices")
+    parser.add_argument("--fidelity", type=int, default=60, help="Granularity in minutes (60=hourly)")
     parser.add_argument(
-        "--fidelity",
-        type=int,
-        default=60,
-        help="Data granularity in minutes (default: 60 = hourly)",
+        "--resolution-types",
+        default="touch_any_time",
+        help="Comma-separated resolution_types to sync. 'all' = no filter. Default: touch_any_time",
     )
+    parser.add_argument("--underlyings", default="BTC,ETH", help="Comma-separated allowlist (default BTC,ETH)")
+    parser.add_argument("--sleep", type=float, default=0.3, help="Sleep seconds between requests")
     args = parser.parse_args()
-    sync_all_markets(fidelity=args.fidelity)
+
+    rt = None if args.resolution_types.lower() == "all" else tuple(s.strip() for s in args.resolution_types.split(",") if s.strip())
+    ul = None if not args.underlyings else tuple(s.strip().upper() for s in args.underlyings.split(",") if s.strip())
+    sync_all_markets(fidelity=args.fidelity, resolution_types=rt, underlyings=ul, sleep_s=args.sleep)

@@ -71,10 +71,20 @@ def upsert_price_history(cur, clob_token_id, history):
     return len(rows)
 
 
-def sync_all_markets(fidelity=60):
+def sync_all_markets(
+    fidelity=60,
+    resolution_types=("touch_any_time",),
+    underlyings=None,
+    sleep_s: float = 0.3,
+):
     """
     For every market in price_events that has a clob_token_id,
     fetch historical prices and store them in bet_price_history.
+
+    By default we only sync ``touch_any_time`` markets — the ones the LP
+    backtester actually uses as IL hedges. Pass ``resolution_types=None``
+    to sync every market (slow on large universes), or restrict further by
+    ``underlyings=("BTC","ETH")``.
     """
     conn = get_db_connection()
     try:
@@ -82,17 +92,30 @@ def sync_all_markets(fidelity=60):
         ensure_history_table(cur)
         conn.commit()
 
+        clauses = ["clob_token_id IS NOT NULL", "active = true"]
+        params: list = []
+        if resolution_types:
+            clauses.append("resolution_type = ANY(%s)")
+            params.append(list(resolution_types))
+        if underlyings:
+            clauses.append("underlying = ANY(%s)")
+            params.append(list(underlyings))
+        where = " AND ".join(clauses)
+
         cur.execute(
-            """
+            f"""
             SELECT DISTINCT clob_token_id, market_id, side, underlying, level, direction
             FROM price_events
-            WHERE clob_token_id IS NOT NULL
-              AND active = true
+            WHERE {where}
             ORDER BY underlying, level
-            """
+            """,
+            params,
         )
         markets = cur.fetchall()
-        logger.info(f"Found {len(markets)} active markets with CLOB token IDs")
+        logger.info(
+            f"Found {len(markets)} active markets with CLOB token IDs "
+            f"(resolution_types={resolution_types}, underlyings={underlyings})"
+        )
 
         total_points = 0
         for i, (clob_id, mkt_id, side, underlying, level, direction) in enumerate(markets, 1):
@@ -111,7 +134,7 @@ def sync_all_markets(fidelity=60):
 
             conn.commit()
 
-            time.sleep(0.3)
+            time.sleep(sleep_s)
 
         logger.info(f"\nDone. Total price points stored: {total_points}")
     finally:

@@ -1,7 +1,7 @@
 {
   "backtest": {
     "pool": "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
-    "days": 60,
+    "days": 180,
     "lookback_days": 0,
     "initial_eth": 50.0,
     "initial_usdc": null,
@@ -10,9 +10,18 @@
     "fixed_range": null,
     "sweep": false,
     "spread": 0.04,
-    "slippage_per_1k_contracts": 0.0,
-    "slippage_max_per_contract": 0.0,
-    "close_policy": "touch",
+    "slippage_per_1k_contracts": 0.02,
+    "slippage_max_per_contract": 0.10,
+    "close_policy": "pessimistic",
+    "touch_settlement_haircut": 0.03,
+    "sell_touched_at_market": true,
+    "risk_free_rate_apy": 0.045,
+    "perp_funding_rate_apy": 0.10,
+    "gas_strict": false,
+    "priority_fee_gwei": 2.0,
+    "restrict_to_touch_markets": true,
+    "polymarket_fee_category": "crypto",
+    "polymarket_fees_enabled": true,
     "telemetry": {
       "enabled": false,
       "path": null
@@ -22,6 +31,6 @@
   "report": {
     "input_json": "active_backtest_results.json",
     "output_html": "report.html",
-    "title": "Hedge of IL in Uniswap Pool (WETH/USDC Pool 0.03%) using Polymarket"
+    "title": "Hedge of IL in Uniswap Pool (WETH/USDC Pool 0.05%) using Polymarket"
   }
 }

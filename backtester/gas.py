@@ -111,19 +111,49 @@ def gas_cost_usd(
     ts: int,
     eth_price: float,
     gas_prices: Dict[str, int],
+    priority_fee_gwei: float = 0.0,
+    strict: bool = False,
 ) -> float:
     """Compute the USD cost of a transaction given its gas units.
 
-    Looks up the daily average gas price (in Wei) for the date of *ts*.
-    Returns 0.0 when no gas data is available for that date.
+    - Looks up the daily average ``baseFeePerGas`` (in Wei) for the date of ``ts``.
+    - Adds ``priority_fee_gwei`` as a constant tip on top of base fee
+      (default 0 to preserve legacy unit-test behaviour).
+    - When data is missing:
+        * ``strict=False``  → return 0.0 (legacy, optimistic)
+        * ``strict=True``   → raise RuntimeError (no silent under-counting)
     """
-    if not gas_prices:
+    date_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+
+    # Allow callers to configure tip + strict-mode by stashing them in the
+    # gas_prices mapping under reserved keys (so we don't have to thread two
+    # extra params through every call site).
+    if isinstance(gas_prices, dict):
+        if priority_fee_gwei == 0.0 and "__priority_fee_gwei__" in gas_prices:
+            try:
+                priority_fee_gwei = float(gas_prices["__priority_fee_gwei__"])
+            except (TypeError, ValueError):
+                priority_fee_gwei = 0.0
+        if not strict and gas_prices.get("__strict__") is True:
+            strict = True
+
+    if not gas_prices or all(str(k).startswith("__") for k in gas_prices):
+        if strict:
+            raise RuntimeError(
+                f"gas_cost_usd: no gas-price data available for {date_str}; "
+                "set ETH_RPC_URL or relax `gas_strict` to allow $0 fallback."
+            )
         return 0.0
 
-    date_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
     avg_wei = gas_prices.get(date_str)
     if avg_wei is None:
+        if strict:
+            raise RuntimeError(
+                f"gas_cost_usd: missing gas-price data for {date_str}; "
+                "fix the RPC source or relax `gas_strict` to allow $0 fallback."
+            )
         return 0.0
 
-    gas_cost_eth = gas_units * avg_wei * 1e-18
+    tip_wei = int(priority_fee_gwei * 1_000_000_000)
+    gas_cost_eth = gas_units * (avg_wei + tip_wei) * 1e-18
     return gas_cost_eth * eth_price
