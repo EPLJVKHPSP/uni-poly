@@ -1,310 +1,284 @@
 # Polymarket × Uniswap V3 Active LP Backtester
 
-> **Audit branch** (`realism-audit-180d`): realistic assumptions, 180-day backtest, and a full post-mortem on why the strategy is structurally unprofitable.
+> **Headline finding:** the *strategy* works. **Polymarket doesn't — yet.**
+> At mid-price (zero-execution-cost) accounting, the anchor-mode hedged LP
+> beats HODL on both BTC and WETH pools. At realistic execution it loses,
+> by **almost exactly the cost of crossing Polymarket's spread + slippage**.
+> Prediction-market depth, not the hedging idea, is the binding constraint.
 
-Backtesting framework for an **active Uniswap V3 LP** strategy that uses **Polymarket prediction markets** as **impermanent loss (IL) insurance**.
-
----
-
-## Table of Contents
-
-1. [Strategy overview](#strategy-overview)
-2. [Range selection algorithm](#range-selection-algorithm)
-3. [EXEC vs MID reporting](#exec-vs-mid-reporting)
-4. [What was changed — the realism audit](#what-was-changed--the-realism-audit)
-5. [180-day headline result](#180-day-headline-result-oct-2025--apr-2026)
-6. [Why it doesn't work — post-mortem](#why-it-doesnt-work--post-mortem)
-7. [Architecture](#architecture)
-8. [Setup](#setup)
-9. [Running a backtest](#running-a-backtest)
-10. [Data pipeline](#data-pipeline)
-11. [Tests](#tests)
-12. [Known limitations](#known-limitations)
+Backtesting framework for an **active Uniswap V3 LP** strategy that uses
+**Polymarket prediction markets** as **impermanent-loss (IL) insurance** and
+restores the LP back to its initial token-ratio (anchor) on every cycle.
 
 ---
 
-## Strategy overview
+## TL;DR — the one number that matters
 
-1. Open a **concentrated LP position** on Uniswap V3 (USDC/WETH 0.05%).
-2. Buy Polymarket **YES contracts** on the lower and upper boundary strikes as IL insurance.
-   - Lower leg: "ETH touches \$X" (down-touch) — pays $1 if ETH falls below the LP range.
-   - Upper leg: "ETH touches \$Y" (up-touch) — pays $1 if ETH rises above the LP range.
-3. **Close & rebalance** when:
-   - price breaches a boundary (position closed at next candle, `pessimistic` policy), or
-   - the insurance market **expires** (the Polymarket touch-market `end_date` passes — position is force-closed and rolled into the next monthly market).
-4. Wait `cooldown_hours`, then open a new position using a freshly-scored range.
-5. Track wallet evolution (USDC + ETH), pool fees, IL, and insurance cashflows across all cycles.
+| Pool                     |  Strategy ROI (EXEC) |  Strategy ROI (MID) |  HODL ROI |  EXEC↔MID gap |  MID − HODL |
+| ------------------------ | -------------------: | ------------------: | --------: | ------------: | ----------: |
+| **WBTC/USDC 0.05%**      |          **−47.25%** |          **+0.78%** |   −7.99%  |  **+48.03 pp** | **+8.77 pp** |
+| **USDC/WETH 0.05%**      |          **−28.70%** |          **−6.69%** |  −16.69%  |  **+22.01 pp** | **+10.00 pp** |
+
+> **Read this row by row:** the strategy column on the right (MID) is the
+> world without Polymarket execution friction. **In that world the hedged LP
+> beats HODL on both pools.** The world we actually live in (EXEC, with 4 ¢
+> spread + fitted slippage + Polymarket taker fees) gives back **all of that
+> alpha and more** — entirely because monthly multi-strike YES contracts
+> aren't deep enough to absorb the order sizes the strategy generates.
+
+180-day window ending **May 16 2026**, anchor mode, full insurance enforced
+on every cycle. Full numbers in §4.
 
 ---
 
-## Range selection algorithm
+## Why this is a depth problem, not a strategy problem
 
-On every candle where no position is open, the algorithm:
+The MID counterfactual is built by reconstructing the same trades at
+Polymarket's **CLOB midpoint** (`prices-history`) and removing the recorded
+spread + slippage drag. Everything else is identical between the two
+columns: same range-selection logic, same anchor restoration, same idle-USDC
+opportunity cost, same Polymarket taker fees, same gas, same touch-resolution
+haircut. The only thing missing in MID is the part of the cost that comes
+from **crossing the bid-ask** and **walking the order book**.
 
-1. **Fetches the candidate universe** — all ETH strike ranges with active Polymarket touch markets at the current candle timestamp (markets rotate monthly).
+|  Component (USD, 180 d)                  |   WBTC/USDC |  USDC/WETH |
+| ---------------------------------------- | ----------: | ---------: |
+| Notional deployed (`investment_usd`)     |   **$873,881** |   **$251,143** |
+| Insurance bought, **EXEC**               |    $426,226 |    $45,926 |
+| Insurance bought, **MID**                |    $289,535 |    $27,543 |
+|   *of which spread cost (EXEC)*          |     $32,705 |     $4,032 |
+|   *of which slippage cost (EXEC)*        |    **$160,654** |    **$18,446** |
+|   *of which Polymarket taker fees*       |     $14,020 |     $2,000 |
+| **Total execution drag**                 |    **$193,360 (22 % of capital)** |    **$22,477 (9 % of capital)** |
+
+Two things stand out:
+
+1. **Slippage > spread on every position.** On the BTC run the slippage
+   bill is **5× the spread bill** ($161 k vs $33 k). The order ladders for
+   the 15–20 ¢ YES contracts the algorithm selects simply do not have enough
+   resting size to absorb the 6-figure-USDC clips this strategy throws at
+   them — the taker walks down the book by 3–5 ¢ on a contract whose mid is
+   15 ¢, i.e. 20–30 % impact per leg.
+
+2. **Drag scales super-linearly with deployed capital.** On WETH at \$251 k
+   notional, drag is ~9 % of capital. On BTC at \$874 k it balloons to
+   ~22 %. Same algorithm, same markets, same window — but order size
+   landed against thinner books on the BTC side and the slippage curve
+   bites harder.
+
+In other words: **the venue is the bottleneck, not the model.** Polymarket's
+monthly multi-strike touch markets clear retail-sized hedges fine; they
+don't clear the size that institutional LPs would want to hedge.
+
+---
+
+## When this strategy is and isn't deployable today
+
+|                                  | Suitable today?                       | Why                                                                |
+| -------------------------------- | ------------------------------------- | ------------------------------------------------------------------ |
+| **Hobby / retail LP** (≤ ~$25 k) |  Plausibly yes                        | Order sizes stay inside the top-of-book; slippage ≈ spread; the MID-EXEC gap shrinks proportionally and the hedge can pay for itself when realised vol > 30 %. |
+| **Mid-size LP** (~$50–250 k)     |  Marginal                             | The ~$251 k WETH cell already burned 9 % of capital in pure execution drag over 180 d. Profitable only in a high-realised-vol regime. |
+| **Institutional LP** (≥ $500 k)  |  **Not yet**                          | Drag scales to 20 %+ of deployed capital. No realistic vol regime closes that gap. Polymarket's order-book depth on monthly multi-strike contracts is the hard cap. |
+
+> **What changes the answer:** longer-dated touch markets (lower rollover
+> frequency), two-sided market-making programs from Polymarket, deeper
+> on-chain CLOB liquidity (e.g. coordinator subsidies on multi-strike
+> markets), or a tier-1 prediction-market venue with order-book depth on the
+> order of perp DEXs would all collapse the execution-drag column. The
+> hedging idea is correct; the venue isn't ready.
+
+---
+
+## Table of contents
+
+1. [Strategy — anchor-mode hedged LP](#1--strategy--anchor-mode-hedged-lp)
+2. [Range selection algorithm](#2--range-selection-algorithm)
+3. [EXEC vs MID reporting](#3--exec-vs-mid-reporting)
+4. [180-day headline numbers](#4--180-day-headline-numbers)
+5. [Realism audit — what was changed](#5--realism-audit--what-was-changed)
+6. [Architecture](#6--architecture)
+7. [Setup](#7--setup)
+8. [Running a backtest](#8--running-a-backtest)
+9. [Reports](#9--reports)
+10. [Tests](#10--tests)
+11. [Known limitations](#11--known-limitations)
+
+---
+
+## 1 · Strategy — anchor-mode hedged LP
+
+For each cycle:
+
+1. **Open** a concentrated LP position on a target pool (default
+   `WBTC/USDC 0.05%` or `USDC/WETH 0.05%` on Mainnet) at the symmetric range
+   `[price · (1−w/2), price · (1+w/2)]` chosen by the range-selection
+   algorithm (§2).
+2. **Buy two YES legs on Polymarket** — lower (price touches \$X) and
+   upper (price touches \$Y) — sized to fully insure the IL the LP would
+   accrue if either boundary is hit (`hedge_sizing_mode = "full_restore"`,
+   minus an `hedge_lp_fee_credit_pct` discount for expected LP-fee income).
+3. **Hold** until either (a) a boundary is breached (force-close at the
+   *next* candle, `pessimistic` policy), or (b) the Polymarket touch market's
+   `end_date` passes (force-close + roll into the next monthly market).
+4. **Restore to anchor.** On close, sell residual LP and remaining YES
+   contracts, then swap back to the original token ratio
+   (`restore_to_anchor=true`). This is the change vs the realism-audit
+   baseline: each cycle starts from the *same* notional and same token
+   split, so cycles are independent and IL doesn't compound across them.
+5. **Cooldown** (`cooldown_hours`, default 1 h), then re-open against a
+   freshly-scored range.
+
+Strict-rule enforcement on every cycle:
+
+* `require_full_insurance = true` — skip the cycle if either Polymarket leg
+  cannot be fully filled.
+* `max_idle_hours = 24` — the run is only valid if no consecutive 24 h
+  window passes without an insured position.
+
+---
+
+## 2 · Range selection algorithm
+
+On every candle where no position is open the algorithm:
+
+1. **Fetches the candidate universe** — all touch markets (`touch_any_time`
+   resolution) for the underlying that are *active as-of the current
+   candle timestamp* (`start_date ≤ ts ≤ end_date`).
 2. **Filters** to ranges that:
-   - **contain the current price** with at least a **5% buffer** on each side (falls back to 2% if nothing qualifies).
-   - are **not wider than 80%** of the current price (no degenerate full-range positions).
-   - have a Polymarket YES probability **≤ 20%** on *both* legs (hard cap to avoid expensive, high-probability insurance).
+   * **contain the current price** with at least a 5 % buffer on each side,
+   * are **not wider than 80 %** of the current price,
+   * have a Polymarket YES probability **≤ `range_yes_cap`** on *both* legs
+     (default 10 % on the WETH best, 2 % on the BTC best — a hard cap on
+     premium per cycle).
 3. **Scores** each surviving range:
    ```
-   score = narrowness_bonus − insurance_cost_rate
-   where narrowness_bonus = 1 − (range_width / widest_candidate)
-         insurance_cost_rate = lower_bet_price + upper_bet_price
+   score = narrowness_bonus  −  insurance_cost_rate
+   narrowness_bonus      = 1 − (range_width / widest_candidate)
+   insurance_cost_rate   = lower_yes_price + upper_yes_price
    ```
-   A narrower range earns more LP fees per dollar deployed; cheaper insurance preserves more capital. The algorithm maximises the trade-off.
-4. **Opens the top-scoring range**, buying both insurance legs at the prevailing Polymarket bid/ask with the configured execution model.
+4. **Opens the top-scoring range**, executing both YES legs through the
+   configured execution model (§3).
 
-The "cheapest and narrowest" heuristic is a sensible objective, but it has a structural bias — explained in the post-mortem below.
+The "cheapest and narrowest" objective biases entries toward correctly-priced
+deep-OTM insurance. That's a feature for premium efficiency but a bug for
+realised payouts (most legs expire worthless), and is the structural reason
+the *unhedged* and *MID-priced* baselines beat the *EXEC* strategy in any
+flat or trending regime.
 
 ---
 
-## EXEC vs MID reporting
+## 3 · EXEC vs MID reporting
 
 Every result is reported in two variants:
 
-| Variant | What it represents |
-|---|---|
-| **EXEC** | Realistic execution: flat bid-ask spread (default 4¢), per-asset fitted slippage, Polymarket dynamic taker-fee curve, and (where available) real L2 VWAP book-walk against Probalytics orderbook snapshots. |
-| **MID** | Counterfactual: execution drag removed. Insurance is priced at the CLOB midpoint with zero spread/slippage. Polymarket taker fees are still folded in. Represents "best-possible execution if Polymarket had full historical depth data." |
+| Variant   | What it represents                                                                                                                                                                                                                       |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **EXEC**  | Realistic execution: flat bid-ask spread (default 4 ¢), per-asset fitted slippage, Polymarket dynamic taker-fee curve, and (where available) real L2 VWAP book-walk against Probalytics order-book snapshots.                            |
+| **MID**   | Counterfactual: execution drag removed. Insurance is priced at the CLOB mid-point with zero spread/slippage. Polymarket taker fees are still folded in. Represents *"best-possible execution if Polymarket had full historical depth."* |
 
-> **Why Polymarket doesn't share historical depth:** Polymarket's public API exposes `prices-history` (hourly midpoints) but does not serve historical L2 snapshots. Probalytics fills this gap for the last 7 days via a ClickHouse SQL interface. For the remaining 173 days in this run, MID uses the official CLOB midpoint from `prices-history` — the best available proxy — and EXEC layers the parametric spread + slippage model on top.
+> **Why Polymarket doesn't expose historical depth:** the public API serves
+> `prices-history` (hourly mid-points) but no historical L2 snapshots.
+> Probalytics fills the last ~7 days via ClickHouse; the rest of any
+> 180-day window uses the official mid-point and EXEC layers a
+> parametric spread + slippage model on top.
 
-The EXEC↔MID gap measures the cost of crossing Polymarket's bid-ask spread and taking liquidity. On thinly-traded monthly multi-strike markets (most of what this algorithm selects), the gap is material.
-
----
-
-## What was changed — the realism audit
-
-The original backtest shipped with several assumptions that overstated strategy performance. Every change below moves the simulation *closer to what an on-chain investor would actually experience*.
-
-### 1 — No-lookahead pricing (critical)
-
-**Problem:** the original code fetched Polymarket prices with `ts <= target_ts OR ts >= target_ts` (nearest row in either direction), which quietly used *future* prices when the current candle had no data. This is a textbook lookahead bias.
-
-**Fix:** `get_historical_bet_price` now uses `strict_past=True` by default — only `ts ≤ target_ts` rows are considered. If no historical mid exists at or before the candle timestamp, the position is skipped (not opened with a guessed price). Entry-price fallback in sellback calculations was also removed.
-
-### 2 — Pessimistic close policy
-
-**Problem:** the original `touch` close policy could book profit from the intra-bar high/low, because it settled the position at `close_price_override = current_price` (the candle close) even when the touch occurred at the candle high. In reality, you can only trade the *next* candle's open.
-
-**Fix:** close policy defaults to `pessimistic` / `next_candle`. When a boundary is touched, the position is flagged but not settled until the *next* candle's close price is known.
-
-### 3 — Realistic touch settlement
-
-**Problem:** the original code credited a touched position with `$1.00 per contract` instantly — as if Polymarket settled in-block with no slippage.
-
-**Fix:** on touch, we now sell YES contracts at the **prevailing Polymarket best-bid** (from `bet_price_history`), less a configurable `touch_settlement_haircut` (default 3¢). For positions held to expiry, the remaining contracts are sold via the same execution model.
-
-### 4 — Gas fees from real RPC data
-
-**Problem:** gas was a constant (or silently zero on missing days).
-
-**Fix:** `fetch_daily_gas_prices` samples `baseFeePerGas` from actual Ethereum blocks via RPC, computes daily averages, and layers a configurable `priority_fee_gwei` tip on top. `validate_gas_coverage` asserts ≥ 100% day coverage and logs a warning if any day is missing. The 180-day run achieved 100% gas coverage.
-
-### 5 — Market classification — touch-anytime only
-
-**Problem:** the market universe mixed `touch_any_time` markets (pay $1 if price touches the strike *any time* during the period — the correct IL-hedge instrument) with `close_on_date` markets (pay $1 only if price is *above/below* the strike at expiry — a different, weaker instrument).
-
-**Fix:** `parser.py` now classifies every fetched market by resolution rule. `restrict_to_touch_markets=true` (default) filters to `touch_any_time` only.
-
-### 6 — Polymarket dynamic taker-fee curve
-
-**Problem:** Polymarket charges a dynamic taker fee (`fee = C × feeRate × (p × (1-p))^exponent`) that peaks near 1.80% at p=0.5 and falls toward ~0.06% at the deep wings. The original code did not model this fee.
-
-**Fix:** `PolymarketFeeModel` implements the published fee curve. `polymarket_fee_category = "crypto"` is the default. The fee is folded into both the buy-leg cost and the sell/sellback price, and is broken out separately in the JSON summary and HTML report.
-
-### 7 — Per-asset slippage fitted from real fills
-
-**Problem:** slippage was a global constant (`$0.02 per 1,000 contracts`), not tied to any observable market microstructure.
-
-**Fix — two layers:**
-- **Layer A (Probalytics fills):** `probalytics_pkg/slippage_fit.py` fits a per-asset slippage curve from Probalytics ClickHouse `fills` data using a window-dispersion heuristic on `normalized_price` (the taker-side execution cost relative to the prevailing midpoint). This produces asset-level (`ETH`, `BTC`) slippage coefficients.
-- **Layer B (bet_trades):** existing per-market slippage fit from the local `bet_trades` table is retained as a fallback for markets not covered by Probalytics.
-
-The Probalytics coefficients are applied globally by asset; per-market coefficients from `bet_trades` override them when available.
-
-### 8 — Real L2 book-walk execution (Probalytics)
-
-**Problem:** even with a fitted slippage model, execution cost was still parametric (a curve, not a real order book).
-
-**Fix:** `probalytics_pkg/ondemand.py` implements `OrderBookFetcher` — an on-demand fetcher that downloads a ±5-minute window of Probalytics L2 snapshots around each trade timestamp, caches them as Parquet, and reconstructs the order book via Last-Observation-Carried-Forward (LOCF). When a real ladder is available, `apply_execution_costs` performs a true VWAP walk (`_vwap_walk`) rather than using the parametric model.
-
-**Coverage in the 180d run:** Probalytics retains data for 7 days. Of 65 positions, 6 open+close pairs fell inside retention and used the real book-walk. The remaining 59 used the parametric model (fitted on data from those same 7 days).
-
-### 9 — Historical price backfill (Oct 2025 → Mar 2026)
-
-**Problem:** `bet_price_history` only had data from March 5, 2026 onwards (49 days of Tier-B realism). The 60-day run prior to this audit used synthetic/fallback prices for the Oct-Feb window.
-
-**Fix:** `scripts/backfill_bet_price_history.py` fetched CLOB `prices-history` for all 1,512 ETH/BTC touch-anytime markets that ended between Oct 1, 2025 and Mar 5, 2026 (6 parallel workers, 8 req/s rate-limit, ~390s total). This delivered 58,447 new price points, lifting Tier-B realism coverage to 98%/98% (lower/upper) across the full 180-day window.
-
-### 10 — Opportunity cost on idle capital
-
-**Problem:** USDC sitting in the wallet (outside the LP or on Polymarket) was not penalised for the foregone risk-free yield.
-
-**Fix:** an annualised `risk_free_rate_apy` (default 4.5%) accrues on idle USDC every hour and is included in the cost-basis calculation. This is a headwind to the strategy — idle capital between positions forfeits ~4.5% APY that a T-bill would earn.
-
-### 11 — Markets queried as-of candle timestamp
-
-**Problem:** the candidate universe was computed once at the start of the run. Monthly multi-strike markets rotate, so stale candidates caused clob-token-id mismatches and missing bet prices for positions opened late in the month.
-
-**Fix:** `get_range_combinations` and `get_clob_token_id` now accept a `candle_ts` parameter and filter to markets whose `start_date ≤ candle_ts ≤ end_date`. The simulation always resolves the candidate universe "as-of" the current candle.
+The EXEC↔MID gap measures the cost of crossing Polymarket's bid-ask spread
+and walking the book. On thinly-traded monthly multi-strike markets (most
+of what this algorithm selects), the gap is **the** result of the
+backtest — see the TL;DR.
 
 ---
 
-## 180-day headline result (Oct 2025 → Apr 2026)
+## 4 · 180-day headline numbers
 
-> Pool: USDC/WETH 0.05% · 50 ETH · ETH $3,904 → $2,404 (−38.4%) · 65 positions
+Window: 2025-11-17 → 2026-05-16. Anchor mode, full insurance every cycle,
+`max_idle_hours = 24`. Configs in `best_btc_anchor.config.json` and
+`best_weth_anchor.config.json`. Reports rendered to
+`WBTC_USDC_best_pool_with_anchor.html` and
+`WETH_USDC_best_pool_with_anchor.html`.
 
-| Metric | Value |
-|---|---|
-| **Cost basis** | $365,095 |
-| **Final wallet (EXEC)** | **$196,660** |
-| **ROI (EXEC)** | **−46.20%** |
-| **APY (EXEC)** | **−71.56%** |
-| **ROI (MID, no spread/slippage)** | **~−30%** (still negative) |
-| HODL benchmark (same initial quantities) | −20.05% |
-| Unhedged active LP benchmark | −26.81% |
-| LP fees earned | +$62,861 |
-| Impermanent loss | −$121,833 |
-| Insurance cost (EXEC) | −$231,763 |
-| Insurance payouts (touches) | +$11,443 (11 payouts / 65 positions) |
-| Insurance sellback at expiry | +$40,560 |
-| **Insurance net** | **−$179,760** |
-| Spread cost (buy + sell) | −$32,944 |
-| Slippage cost | −$14,000 (est.) |
-| Polymarket taker fees | included in insurance cost |
-| Gas + swap fees | −$1,842 |
-| Polymarket history coverage | 98% lower / 98% upper |
-| Positions using real book-walk | 6 / 65 |
-
-**ETH fell 38% over the period.** An unhedged LP still outperformed the hedged strategy by 19+ percentage points.
-
----
-
-## Why it doesn't work — post-mortem
-
-### The core equation
-
-```
-Strategy PnL = LP fees − IL − Insurance net − Execution costs − Gas
-```
-
-Over 180 days:
-```
-            LP fees:  +$62,861   ✓
-                IL:  −$121,833
-  Insurance net:     −$179,760   ← 1.5× the IL it was meant to offset
-Execution costs:      −$47,786
-           Gas:           −$294
-```
-
-**Insurance cost is 1.5× the impermanent loss it was supposed to offset.** The hedge costs more than the risk it covers — every cycle.
+|  Metric                                  |  WBTC/USDC 0.05% (anchor)         |  USDC/WETH 0.05% (anchor)        |
+| ---------------------------------------- | --------------------------------: | -------------------------------: |
+| Initial principal                        | 5 BTC ($460,054 at open)          | 50 ETH ($150,973 at open)        |
+| Cumulative notional (`investment_usd`)   | $873,881                          | $251,143                         |
+| Cycles                                   | 20 (20 / 20 insured)              | 15 (15 / 15 insured)             |
+| Lower / upper boundary touches           | 5 / 4                             | 2 / 1                            |
+| Underlying move                          | $92,011 → $78,038 (−15.2 %)       | $3,019 → $2,181 (−27.8 %)        |
+| **EXEC strategy ROI / APY**              | **−47.25 % / −72.68 %**           | **−28.70 % / −49.64 %**          |
+| **MID strategy ROI / APY**               | **+0.78 % / +1.58 %**             | **−6.69 % / −13.10 %**           |
+| HODL ROI / APY                           | −7.99 % / −15.55 %                | −16.69 % / −30.95 %              |
+| Unhedged active LP ROI                   | −21.61 %                          | −15.66 %                         |
+| **EXEC vs HODL**                         | **−39.26 pp ROI · −57.13 pp APY** | **−12.01 pp ROI · −18.69 pp APY** |
+| **MID vs HODL**                          | **+8.77 pp ROI · +17.13 pp APY**  | **+10.00 pp ROI · +17.85 pp APY** |
+| LP fees earned                           | $41,382                           | $31,212                          |
+| Insurance buy (EXEC / MID)               | $426,226 / $289,535               | $45,926 / $27,543                |
+| Insurance payout                         | $71,027                           | $3,956                           |
+| Insurance sellback (EXEC / MID)          | $149,763 / $206,432               | $11,078 / $15,172                |
+| Spread cost                              | $32,705                           | $4,032                           |
+| Slippage cost                            | $160,654                          | $18,446                          |
+| Polymarket taker fees                    | $14,020                           | $2,000                           |
+| Gas (180 d)                              | $2,953                            | $66                              |
+| Total IL realised                        | −$417,219                         | −$47,790                         |
+| **Total execution drag**                 | **$193,360 (≈ +48 pp ROI)**       | **$22,477 (≈ +22 pp ROI)**       |
 
 ---
 
-### Reason 1: 86% of openings are calendar rollovers, not market signals
+## 5 · Realism audit — what was changed
 
-Of 65 positions:
+These eleven fixes (carried over from the `realism-audit-180d` baseline)
+are what makes the EXEC↔MID comparison honest. Removing any of them would
+overstate either the strategy or the counterfactual.
 
-| Trigger | Count | Meaning |
-|---|---|---|
-| Hedge expired (time-driven rollover) | 56 (86%) | Polymarket monthly market `end_date` passed with no breach; forced close and re-open into the next market |
-| Rebalance ↓ (price-driven) | 5 | LP range breached on the lower side |
-| Rebalance ↑ (price-driven) | 3 | LP range breached on the upper side |
-| First open | 1 | |
-
-**56 of 65 premiumpayments were for protection that expired worthless.** The LP range survived every expiry cycle — precisely because the algorithm biases toward cheap, out-of-the-money wings (the ≤20% YES-probability cap). The market was correctly pricing those wings as low-probability touches, and they mostly didn't touch.
-
-Each rollover paid a fresh insurance premium (median **0.80% of LP deposit**, max 4.18%, mean 1.22%). Across 56 expiries, that compounds to roughly 45% of total capital cycled through premiums in a period where LP fees only reimbursed ~25% of that premium spend.
-
----
-
-### Reason 2: The 20% YES-cap biases entries toward correctly-priced deep OTM insurance
-
-The range-selection hard cap `lower_bet_price ≤ 0.20 AND upper_bet_price ≤ 0.20` was intended to keep insurance cheap. But on an efficient market, a YES price of ≤20¢ means *the market assigns ≤20% probability to the touch event*. Over 180 days the realized touch rate was **8.5%** (11 touches across 130 contracts = 65 positions × 2 legs) — consistent with or below the implied probability. The market was not mispriced.
-
-Buying correctly-priced options at 15–20¢ and watching 91.5% of them expire worthless is exactly what short-options sellers earn their premium for. The LP is *on the wrong side* of the trade: it should be selling the insurance, not buying it.
-
----
-
-### Reason 3: Implied vol > realized vol in every sub-period
-
-The vol premium embedded in Polymarket YES prices is the fundamental headwind. ETH spent most of the period grinding lower (Oct–Nov bull, Dec–Jan chop, Feb–Apr drawdown) rather than violently breaching the strike bands. Insurance has positive expected value only when realized volatility exceeds implied volatility. Here:
-
-- **Bull phase (Oct → Dec 2025):** ETH went from $3,900 to $3,300. Most of the range moves were drift, not jumps — the upper boundaries were never threatened; a few lower boundaries touched.
-- **Drawdown (Jan → Apr 2026):** ETH fell from $3,300 to $2,400. Most of this was a slow grind below every rebalanced range — IL accrued linearly but the insurance legs expired worthless because price didn't breach the strike with enough speed for the touch market to register.
-
----
-
-### Reason 4: LP fees don't scale with insurance spend
-
-The algorithm tries to maximise the narrowness-score to earn more LP fees. But the fee market is driven by pool volume and the width of the active range, not by the insurance cost. Over the 180-day period:
-
-- **LP fees ≈ $62k** (0.17% of average deployed capital per position).
-- **Insurance spend ≈ $232k** — 3.7× the LP fees.
-
-For the strategy to break even at MID (ignoring execution drag), the ratio would need to invert: LP fees ≥ insurance net loss. That would require either (a) 3–4× higher pool volume, (b) insurance priced at ≤ 25–30% of current levels, or (c) a volatile regime where ≥ 60% of touches actually pay.
+1. **No-lookahead pricing.** `get_historical_bet_price` uses
+   `strict_past=True`; `ts ≤ target_ts` only. Cycles that find no
+   historical mid are skipped, not opened with a guessed price.
+2. **Pessimistic close policy.** Boundary breaches close at the *next*
+   candle's price, not the breaching candle.
+3. **Realistic touch settlement.** YES contracts on a touched leg are
+   sold at the prevailing best-bid less a `touch_settlement_haircut`
+   (default 3 ¢), not credited at \$1.00.
+4. **Gas from real RPC data.** `fetch_daily_gas_prices` samples
+   `baseFeePerGas` from Ethereum blocks; `priority_fee_gwei` tip layered on
+   top. ≥ 100 % day coverage validated.
+5. **Touch-anytime markets only.** `parser.py` classifies every fetched
+   market by resolution rule; `restrict_to_touch_markets=true` filters
+   out `close_on_date` and other non-touch markets.
+6. **Polymarket dynamic taker-fee curve.**
+   `fee = C × feeRate × (p · (1−p))^exp`, `crypto` category by default;
+   folded into both buy and sell legs.
+7. **Per-asset slippage** fit from real fills via Probalytics + per-market
+   fit from local `bet_trades` as fallback.
+8. **Real L2 book-walk** for the last ~7 days via Probalytics
+   `OrderBookFetcher` with on-demand caching and LOCF reconstruction.
+9. **Historical price backfill** for Oct 2025 → present
+   (`scripts/backfill_bet_price_history.py`) — 98 %/98 % lower/upper
+   coverage on the 180-day window.
+10. **Opportunity cost** on idle USDC (`risk_free_rate_apy`, default 4.5 %).
+11. **Markets queried as-of candle timestamp** so the candidate universe
+    rotates correctly on monthly market changes.
 
 ---
 
-### Reason 5: Execution drag is real and structural (EXEC only)
-
-Even removing all discussion of the structural insurance bet, EXEC underperforms MID by ~$50k ($32k spread + ~$18k slippage + Polymarket fees). This gap exists because:
-
-- Polymarket monthly multi-strike markets are thinly traded; the bid-ask spread on a 15¢ YES contract is routinely 3–5¢ wide (20–30% of fair value).
-- The slippage model fitted from Probalytics fills captures real market impact from taker orders of the sizes the strategy uses.
-- The Polymarket taker fee (1.5–1.8% at p=0.15 for the `crypto` category) is non-trivial.
-
-Halving the spread assumption to 2¢ and zeroing slippage saves ~$25k — not enough to make the strategy profitable.
-
----
-
-### What would make it work
-
-| Lever | Direction needed | Current value | Required for MID break-even |
-|---|---|---|---|
-| Insurance YES-price cap | Raise it | 20% | ≥ 50% (buy properly-priced protection, not just cheap wings) |
-| Implied vol vs realized vol | Need realized > implied | Realized ~8.5%, implied ~15% | Regime where realized ≥ 30%+ |
-| LP fee rate | Need higher | ~0.17%/position | ≥ 0.5%/position |
-| Touch-market liquidity | Need tighter spread | ~4¢ spread | ≤ 2¢ (requires deeper markets) |
-| Calendar rollover frequency | Need less frequent | 56/65 (86%) | ≤ 40% (longer-dated markets) |
-
-The strategy has a plausible long-volatility regime where it works: rapid, large ETH moves that hit both insurance legs frequently (e.g., a 2021-style +/−50% month). The 180-day window studied here was the opposite: a prolonged, low-impulse drawdown.
-
----
-
-## Architecture
+## 6 · Architecture
 
 ```
 active_backtester.py             Backward-compat shim; config-driven entrypoint
 
 backtester/
-  simulation.py                  Core loop: open/close/rebalance, expiry, summaries
-  positions.py                   Position lifecycle: LP deposit/withdraw + insurance execution
+  simulation.py                  Core loop: open/close/rebalance, expiry, anchor restore, summaries
+  positions.py                   Position lifecycle: LP deposit/withdraw + insurance execution + restore
   range_selection.py             Candidate filtering, scoring, Polymarket YES cap
   gas.py                         Historical baseFee sampling via Ethereum RPC (daily)
   polymarket_execution.py        apply_execution_costs: spread, slippage, fee curve, book-walk
   graph_client.py                The Graph client for Uniswap V3 candles
   slippage_fit.py                Per-market slippage curve fit from bet_trades
 
-probalytics_pkg/
-  client.py                      ProbalyticsRest + ClickHouse connection helpers
-  markets_sync.py                Sync BTC/ETH strike market universe from Probalytics CH
-  books_sync.py                  Bulk orderbook snapshot downloader (per-market, per-day)
-  ondemand.py                    OrderBookFetcher: on-demand ±5min window + caching
-  replay.py                      OrderBookReplay: LOCF reconstruction + VWAP-on-book
-  slippage_fit.py                Per-asset slippage fit from Probalytics fills
-
-polymarket_history_pkg/
-  clob_client.py                 Polymarket CLOB prices-history fetcher
-  sync.py                        bet_price_history schema + upsert
-  trades_sync.py                 bet_trades sync from Polymarket data API
-  strike_slugs.py                Canonical ETH/BTC strike-market slug reconstruction
+probalytics_pkg/                 Probalytics REST + ClickHouse, market-universe sync, on-demand books, LOCF VWAP
+polymarket_history_pkg/          CLOB prices-history, bet-trades sync, strike-slug reconstruction
 
 scripts/
-  viz_report.py                  Plotly HTML report: cumulative PnL, trade list, explainer
-  backfill_bet_price_history.py  Parallel CLOB history backfill for Oct 2025 → Mar 2026
+  viz_report.py                  Plotly HTML report — headline ROI / cumulative PnL (EXEC + MID) / trade lists
+  backfill_bet_price_history.py  Parallel CLOB history backfill
   probalytics_sync.py            CLI orchestrator: markets + fills + orderbooks
   probalytics_status.py          Local Probalytics data coverage summary
 
@@ -312,12 +286,14 @@ db_utils.py                      Postgres queries (markets, CLOB IDs, price hist
 parser.py                        Sync Polymarket markets → price_events (targeted + keyset)
 polymarket_history.py            Sync CLOB price history → bet_price_history
 docker-compose.yml               PostgreSQL + pgAdmin
-config.json                      All backtest parameters (no CLI flags)
+config.json                      Default backtest parameters
+best_btc_anchor.config.json      Headline BTC anchor config
+best_weth_anchor.config.json     Headline WETH anchor config
 ```
 
 ---
 
-## Setup
+## 7 · Setup
 
 ### 1) Database
 
@@ -333,7 +309,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3) Environment variables (`.env`)
+### 3) `.env`
 
 **Required:**
 ```bash
@@ -348,6 +324,7 @@ DB_PASSWORD=polymarket_pw
 **Recommended:**
 ```bash
 ETH_RPC_URL=https://ethereum.publicnode.com    # for gas sampling
+BACKTEST_SUBGRAPH_ID=5zvR82QoaXYFyDEKLZ9t6v9adgnptxYpKpSbxtgVENFV
 ```
 
 **Optional — Probalytics (real L2 fills + orderbooks):**
@@ -358,83 +335,117 @@ PROBALYTICS_CLICKHOUSE_HOST=<host>
 PROBALYTICS_CLICKHOUSE_DATABASE=<db>
 PROBALYTICS_CLICKHOUSE_USER=<user>
 PROBALYTICS_CLICKHOUSE_PASSWORD=<password>
-PROBALYTICS_DATA_ROOT=data/probalytics          # local Parquet cache
+PROBALYTICS_DATA_ROOT=data/probalytics
 ```
 
 ---
 
-## Running a backtest
+## 8 · Running a backtest
 
-### 1) Populate Polymarket data
+### Populate Polymarket data (one-time)
 
 ```bash
-# Targeted mode — reconstructs canonical ETH/BTC strike slugs, ~30s:
-python3 parser.py --mode targeted --start 2025-10-01 --end 2026-04-28
+# Reconstruct canonical ETH/BTC strike slugs and sync market universe (~30 s):
+python3 parser.py --mode targeted --start 2025-11-01 --end 2026-05-16
 
 # Sync historical CLOB midpoints for all fetched markets:
 python3 polymarket_history.py --underlyings BTC,ETH
 
-# Backfill Oct 2025 → Mar 2026 (skips markets already synced, idempotent):
-python3 -m scripts.backfill_bet_price_history --start 2025-10-01 --end 2026-03-06
+# Backfill any historical gaps (idempotent):
+python3 -m scripts.backfill_bet_price_history --start 2025-11-01 --end 2026-05-16
 
-# Optional: sync trade fills for per-market slippage fitting:
+# Optional: per-market slippage fits from trades:
 python3 -m polymarket_history_pkg.trades_sync
 ```
 
-### 2) (Optional) Sync Probalytics data
+### Run the headline configs
 
 ```bash
-# Sync market universe + fills (requires Probalytics Pro plan):
-python3 -m scripts.probalytics_sync --assets bitcoin,ethereum
+set -a && source .env && set +a
+source venv/bin/activate
 
-# Check local coverage:
-python3 -m scripts.probalytics_status
+# BTC (≈ 2 min):
+BACKTEST_CONFIG_PATH=best_btc_anchor.config.json \
+    python3 -c "from backtester import main; main()"
+BACKTEST_CONFIG_PATH=best_btc_anchor.config.json \
+    python3 scripts/viz_report.py
+# → writes best_btc_anchor.json (raw simulation output) and
+#         WBTC_USDC_best_pool_with_anchor.html (Plotly report)
+
+# WETH (≈ 2 min):
+BACKTEST_CONFIG_PATH=best_weth_anchor.config.json \
+    python3 -c "from backtester import main; main()"
+BACKTEST_CONFIG_PATH=best_weth_anchor.config.json \
+    python3 scripts/viz_report.py
+# → writes best_weth_anchor.json and
+#         WETH_USDC_best_pool_with_anchor.html
 ```
 
-### 3) Configure `config.json`
+The same `BACKTEST_CONFIG_PATH` controls both the simulator and the report
+generator: `report.input_json`, `report.output_html`, and `report.title`
+all live in the config file.
 
-Key parameters:
+### Run a custom config
 
-| Parameter | Default | Notes |
-|---|---|---|
-| `days` | `180` | Backtest window in days |
-| `initial_eth` | `50.0` | Principal in ETH |
-| `spread` | `0.04` | Polymarket bid-ask half-spread (¢) |
-| `slippage_per_1k_contracts` | `0.02` | Parametric slippage (per 1k contracts, USDC) |
-| `slippage_max_per_contract` | `0.10` | Per-contract cap |
-| `close_policy` | `pessimistic` | `touch` \| `next_candle` \| `pessimistic` |
-| `touch_settlement_haircut` | `0.03` | Haircut from $1.00 when selling touched YES (¢) |
-| `polymarket_fee_category` | `crypto` | Taker fee curve category |
-| `risk_free_rate_apy` | `0.045` | Opportunity cost on idle USDC |
-| `restrict_to_touch_markets` | `true` | IL-hedge instruments only |
+Copy either headline config and tune:
 
-### 4) Run
-
-```bash
-python3 active_backtester.py          # writes active_backtest_results.json
-python3 -m scripts.viz_report         # writes report.html
+```jsonc
+{
+  "backtest": {
+    "pool":                       "0x...",       // Uniswap V3 pool
+    "days":                       180,
+    "initial_eth":                50.0,          // (or initial_usdc)
+    "fixed_range_pct":            30.0,          // ± symmetric range, %
+    "range_yes_cap":              0.10,          // hard cap on YES probability
+    "min_hedge_tte_hours":        336,           // require ≥ 14 d to expiry
+    "max_idle_hours":             24,            // strict-rule budget
+    "require_full_insurance":     true,          // skip cycle if any leg unfillable
+    "restore_to_anchor":          true,          // anchor mode
+    "hedge_sizing_mode":          "full_restore",
+    "hedge_lp_fee_credit_pct":    0.70,          // pre-credit expected LP fees
+    "spread":                     0.04,
+    "slippage_per_1k_contracts":  0.02,
+    "polymarket_fee_category":    "crypto",
+    "risk_free_rate_apy":         0.045,
+    "output_json":                "<your-name>.json"
+  },
+  "report": {
+    "input_json":   "<your-name>.json",
+    "output_html":  "<your-name>.html",
+    "title":        "Your title"
+  }
+}
 ```
 
 ---
 
-## Data pipeline
+## 9 · Reports
 
-### Tiered realism
+`scripts/viz_report.py` generates a self-contained Plotly HTML report with
+seven panels, top-to-bottom:
 
-The backtest operates at different fidelity levels depending on data availability:
+1. **Headline ROI / APY** — EXEC and MID side-by-side; *Strategy vs HODL*
+   on the top row.
+2. **Balances + cashflow ledger** — initial / final / Polymarket / LP fees,
+   EXEC vs MID columns.
+3. **Strategy ranges over time** — price + range bands + entry markers.
+4. **Cumulative PnL — EXEC** — strategy curve, HODL, cumulative
+   insurance net (EXEC), cumulative LP fees.
+5. **Cumulative PnL — MID** — same layout but with the strategy curve
+   reconstructed by adding back per-position spread + slippage drag and
+   the insurance net recomputed at MID prices.
+6. **Trade list — EXEC** — per-cycle ledger.
+7. **Trade list — MID** — same columns; only the insurance columns are
+   re-priced.
 
-| Tier | What's available | Window |
-|---|---|---|
-| **A** — Max realism | Real L2 VWAP book-walk (Probalytics orderbooks) | Last 7 days |
-| **B** — High realism | Probalytics-fitted slippage + CLOB historical midpoints | Oct 2025 → present |
-| **C** — Coarse | `bet_trades`-fitted slippage + CLOB historical midpoints | ~6 months |
-| **D** — Synthetic | No historical mids; fallback to 50% priors | Before Oct 2025 |
-
-The 180-day run reported above used **Tier B** for the full window, with 6/65 positions upgraded to **Tier A** (the last 7 days).
+Both trade-list tables use the same column layout (`Days`, `Why entered`,
+`Why closed`, range, width, buffers, insurance buy / payout / sell / net,
+LP fees, IL, Δ wallet) — only the EXEC/MID tag on the insurance columns
+differs.
 
 ---
 
-## Tests
+## 10 · Tests
 
 ```bash
 make test
@@ -442,18 +453,34 @@ make test
 pytest tests/ -v
 ```
 
-Test coverage includes:
-- `test_polymarket_execution.py` — spread/slippage model, book-walk VWAP, fee curve
-- `test_simulate.py` — core simulation loop, range selection, close policies
-- `test_db_utils.py` — strict no-lookahead queries
-- `test_probalytics_slippage_fit.py` — slippage estimator from fills
-- `test_strike_slugs.py` — slug reconstruction
+Test coverage:
+
+* `test_polymarket_execution.py` — spread/slippage model, book-walk VWAP, fee curve
+* `test_simulate.py` — core simulation loop, range selection, close policies, anchor restore
+* `test_db_utils.py` — strict no-lookahead queries
+* `test_probalytics_slippage_fit.py` — slippage estimator from fills
+* `test_strike_slugs.py` — slug reconstruction
 
 ---
 
-## Known limitations
+## 11 · Known limitations
 
-- **Historical L2 depth:** Probalytics retains orderbook data for 7 rolling days. Older positions use the parametric slippage model. MID prices use official CLOB midpoints (`prices-history`) which can be stale on illiquid markets.
-- **Monthly market rotation:** the range universe is re-queried as-of each candle timestamp, but Polymarket's strike spacing changes between months (affects which ranges are selectable in different periods).
-- **No cross-market delta hedge:** the strategy takes unhedged ETH delta in the LP. A perp-funded LP baseline (constant funding-rate proxy) would be the natural next comparison.
-- **No gas in MID:** opportunity-cost accounting and gas are the same in both variants; only spread + slippage are removed in MID.
+* **Historical L2 depth.** Probalytics retains order-book data for ~7 days.
+  Older positions use the parametric slippage model. MID prices use the
+  official CLOB midpoint (`prices-history`) which can be stale on illiquid
+  markets — this *understates* execution drag if anything.
+* **Monthly market rotation.** The range universe is re-queried as-of each
+  candle timestamp, but Polymarket's strike spacing changes between months,
+  which affects which ranges are selectable in different periods.
+* **No cross-market delta hedge.** The strategy takes unhedged ETH/BTC
+  delta in the LP. A perp-funded LP baseline (constant funding-rate proxy)
+  would be the natural next comparison.
+* **Anchor restoration assumes deep AMM liquidity.** The
+  `restore_to_anchor=true` swap back to the original token ratio is priced
+  at the next-candle close with `swap_fee_usdc` accounting; for very large
+  LPs the realised swap impact would exceed this approximation.
+* **MID is not zero-cost.** Polymarket taker fees, opportunity cost on
+  idle USDC, gas, and swap fees are *all retained* in the MID
+  counterfactual — only the spread + slippage components are removed. So
+  the MID column is an *upper bound* on what better Polymarket execution
+  could deliver, not a free-money number.

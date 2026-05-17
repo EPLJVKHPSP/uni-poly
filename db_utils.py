@@ -1,12 +1,27 @@
 """Database utilities for Polymarket data extraction and queries."""
 
 import os
-import psycopg2
-from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 
 load_dotenv(override=True)
+
+
+def _psycopg2_connect(**kwargs):
+    try:
+        import psycopg2
+    except ImportError as exc:  # insured-only dependency
+        raise ImportError(
+            "Polymarket / insured-range backtests need PostgreSQL. "
+            "Install: pip install psycopg2-binary"
+        ) from exc
+    return psycopg2.connect(**kwargs)
+
+
+def _real_dict_cursor():
+    from psycopg2.extras import RealDictCursor
+
+    return RealDictCursor
 
 
 def get_db_connection():
@@ -18,7 +33,7 @@ def get_db_connection():
         "host": os.getenv("DB_HOST", "localhost"),
         "port": int(os.getenv("DB_PORT", "5432")),
     }
-    return psycopg2.connect(**db_config)
+    return _psycopg2_connect(**db_config)
 
 
 def _resolution_filter_sql(cur, restrict_to_touch: bool) -> str:
@@ -72,7 +87,7 @@ def get_range_combinations(
         candle_ts = datetime.fromtimestamp(int(candle_ts), tz=tz.utc)
 
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        with conn.cursor(cursor_factory=_real_dict_cursor()) as cur:
             touch_filter = _resolution_filter_sql(cur, restrict_to_touch_markets)
             if candle_ts is None:
                 cur.execute(
@@ -166,8 +181,26 @@ def get_clob_token_id(
     side: str = "Yes",
     conn=None,
     candle_ts=None,
+    restrict_to_touch_markets: bool = False,
+    min_market_volume: float = 0.0,
 ) -> Optional[str]:
-    """Look up the CLOB token ID for a specific Polymarket market."""
+    """Look up the CLOB token ID for a specific Polymarket market.
+
+    Selection priority (deepest-first):
+      1. ``market_volume DESC NULLS LAST`` — pick the most-traded market
+         at this (level, direction). Higher volume == better depth ==
+         lower slippage when we hit the order book.
+      2. ``end_date ASC`` as a tiebreaker — prefer the soonest expiry
+         when depth is identical (legacy behaviour).
+
+    Optional filters:
+      - ``restrict_to_touch_markets``: drop markets whose
+        ``resolution_type`` is not ``touch_any_time`` (or NULL). Touch is
+        the only resolution geometry that matches LP barrier-hit risk.
+      - ``min_market_volume``: drop markets whose cumulative trading
+        volume is below this USD threshold. Set to e.g. 1000 to refuse
+        ghost markets that have never been traded.
+    """
     from datetime import datetime, timezone as tz
 
     if candle_ts is not None and isinstance(candle_ts, (int, float)):
@@ -181,9 +214,15 @@ def get_clob_token_id(
 
     try:
         with conn.cursor() as cur:
+            touch_filter = _resolution_filter_sql(cur, restrict_to_touch_markets)
+            vol_filter = ""
+            params_extra: tuple = ()
+            if min_market_volume and float(min_market_volume) > 0.0:
+                vol_filter = " AND market_volume IS NOT NULL AND market_volume >= %s "
+                params_extra = (float(min_market_volume),)
             if candle_ts is None:
                 cur.execute(
-                    """
+                    f"""
                     SELECT clob_token_id
                     FROM price_events
                     WHERE underlying = %s
@@ -192,13 +231,16 @@ def get_clob_token_id(
                       AND side = %s
                       AND active = true
                       AND clob_token_id IS NOT NULL
+                      {touch_filter}
+                      {vol_filter}
+                    ORDER BY market_volume DESC NULLS LAST, end_date ASC NULLS LAST
                     LIMIT 1
                     """,
-                    (token_symbol, level, direction, side),
+                    (token_symbol, level, direction, side, *params_extra),
                 )
             else:
                 cur.execute(
-                    """
+                    f"""
                     SELECT clob_token_id
                     FROM price_events
                     WHERE underlying = %s
@@ -208,12 +250,100 @@ def get_clob_token_id(
                       AND clob_token_id IS NOT NULL
                       AND (created_at IS NULL OR created_at <= %s)
                       AND (end_date IS NULL OR end_date >= %s)
+                      {touch_filter}
+                      {vol_filter}
+                    ORDER BY market_volume DESC NULLS LAST, end_date ASC NULLS LAST
                     LIMIT 1
                     """,
-                    (token_symbol, level, direction, side, candle_ts, candle_ts),
+                    (token_symbol, level, direction, side, candle_ts, candle_ts, *params_extra),
                 )
             row = cur.fetchone()
             return row[0] if row else None
+    finally:
+        if should_close:
+            conn.close()
+
+
+def get_clob_token_id_with_meta(
+    token_symbol: str,
+    level: float,
+    direction: str,
+    side: str = "Yes",
+    conn=None,
+    candle_ts=None,
+    restrict_to_touch_markets: bool = False,
+    min_market_volume: float = 0.0,
+) -> Optional[Tuple[str, Any, float]]:
+    """Like get_clob_token_id but also returns end_date and market_volume.
+
+    Returns ``(clob_token_id, end_date, market_volume)`` or None when no
+    row matches. The third tuple element is 0.0 when ``market_volume`` is
+    NULL in the DB (lets callers treat it as a depth proxy uniformly).
+
+    Same depth-first ordering and optional touch / min-volume filters as
+    ``get_clob_token_id``.
+    """
+    from datetime import datetime, timezone as tz
+
+    if candle_ts is not None and isinstance(candle_ts, (int, float)):
+        candle_ts = datetime.fromtimestamp(int(candle_ts), tz=tz.utc)
+
+    if conn is None:
+        conn = get_db_connection()
+        should_close = True
+    else:
+        should_close = False
+
+    try:
+        with conn.cursor() as cur:
+            touch_filter = _resolution_filter_sql(cur, restrict_to_touch_markets)
+            vol_filter = ""
+            params_extra: tuple = ()
+            if min_market_volume and float(min_market_volume) > 0.0:
+                vol_filter = " AND market_volume IS NOT NULL AND market_volume >= %s "
+                params_extra = (float(min_market_volume),)
+            if candle_ts is None:
+                cur.execute(
+                    f"""
+                    SELECT clob_token_id, end_date, market_volume
+                    FROM price_events
+                    WHERE underlying = %s
+                      AND level = %s
+                      AND direction = %s
+                      AND side = %s
+                      AND active = true
+                      AND clob_token_id IS NOT NULL
+                      {touch_filter}
+                      {vol_filter}
+                    ORDER BY market_volume DESC NULLS LAST, end_date ASC NULLS LAST
+                    LIMIT 1
+                    """,
+                    (token_symbol, level, direction, side, *params_extra),
+                )
+            else:
+                cur.execute(
+                    f"""
+                    SELECT clob_token_id, end_date, market_volume
+                    FROM price_events
+                    WHERE underlying = %s
+                      AND level = %s
+                      AND direction = %s
+                      AND side = %s
+                      AND clob_token_id IS NOT NULL
+                      AND (created_at IS NULL OR created_at <= %s)
+                      AND (end_date IS NULL OR end_date >= %s)
+                      {touch_filter}
+                      {vol_filter}
+                    ORDER BY market_volume DESC NULLS LAST, end_date ASC NULLS LAST
+                    LIMIT 1
+                    """,
+                    (token_symbol, level, direction, side, candle_ts, candle_ts, *params_extra),
+                )
+            row = cur.fetchone()
+            if not row:
+                return None
+            mv = float(row[2]) if row[2] is not None else 0.0
+            return (row[0], row[1], mv)
     finally:
         if should_close:
             conn.close()
@@ -289,12 +419,32 @@ def get_candidate_markets(
     side: str = "Yes",
     conn=None,
     candle_ts=None,
+    restrict_to_touch_markets: bool = False,
+    min_market_volume: float = 0.0,
 ) -> List[Dict[str, Any]]:
     """
-    Return candidate Polymarket markets for a given (underlying, level, direction, side)
-    that are valid at candle_ts and have a future (non-null) end_date.
+    Return candidate Polymarket markets for a given (underlying, level,
+    direction, side) that are valid at candle_ts and have a future
+    (non-null) end_date.
 
-    Each row includes: clob_token_id, market_id, end_date.
+    Each row includes: ``clob_token_id``, ``market_id``, ``end_date``,
+    and ``market_volume`` (the depth proxy used by downstream slippage
+    estimation).
+
+    Selection priority is **deepest-first**: rows are ordered by
+    ``market_volume DESC NULLS LAST``, then ``end_date ASC`` as a
+    tiebreaker. Callers that take ``[0]`` therefore get the deepest
+    market available at the (level, direction, candle_ts) cell, which
+    minimises slippage at execution. The previous behaviour ordered by
+    ``end_date ASC`` only and systematically picked the smallest-volume
+    market at each open.
+
+    When ``restrict_to_touch_markets=True``, drop non-touch markets so
+    the hedge geometry actually matches LP barrier-hit risk.
+
+    When ``min_market_volume > 0``, drop ghost markets whose cumulative
+    USD trading volume is below the threshold (e.g. recommend ~$1k to
+    skip never-traded mids).
     """
     from datetime import datetime, timezone as tz
 
@@ -308,11 +458,17 @@ def get_candidate_markets(
         should_close = False
 
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        with conn.cursor(cursor_factory=_real_dict_cursor()) as cur:
+            touch_filter = _resolution_filter_sql(cur, restrict_to_touch_markets)
+            vol_filter = ""
+            params_extra: tuple = ()
+            if min_market_volume and float(min_market_volume) > 0.0:
+                vol_filter = " AND market_volume IS NOT NULL AND market_volume >= %s "
+                params_extra = (float(min_market_volume),)
             if candle_ts is None:
                 cur.execute(
-                    """
-                    SELECT clob_token_id, market_id, end_date
+                    f"""
+                    SELECT clob_token_id, market_id, end_date, market_volume
                     FROM price_events
                     WHERE underlying = %s
                       AND level = %s
@@ -321,14 +477,16 @@ def get_candidate_markets(
                       AND active = true
                       AND clob_token_id IS NOT NULL
                       AND end_date IS NOT NULL
-                    ORDER BY end_date ASC
+                      {touch_filter}
+                      {vol_filter}
+                    ORDER BY market_volume DESC NULLS LAST, end_date ASC
                     """,
-                    (token_symbol, level, direction, side),
+                    (token_symbol, level, direction, side, *params_extra),
                 )
             else:
                 cur.execute(
-                    """
-                    SELECT clob_token_id, market_id, end_date
+                    f"""
+                    SELECT clob_token_id, market_id, end_date, market_volume
                     FROM price_events
                     WHERE underlying = %s
                       AND level = %s
@@ -338,9 +496,11 @@ def get_candidate_markets(
                       AND end_date IS NOT NULL
                       AND end_date > %s
                       AND (created_at IS NULL OR created_at <= %s)
-                    ORDER BY end_date ASC
+                      {touch_filter}
+                      {vol_filter}
+                    ORDER BY market_volume DESC NULLS LAST, end_date ASC
                     """,
-                    (token_symbol, level, direction, side, candle_ts, candle_ts),
+                    (token_symbol, level, direction, side, candle_ts, candle_ts, *params_extra),
                 )
             return list(cur.fetchall())
     finally:

@@ -1,9 +1,11 @@
 """Historical gas prices via free public Ethereum RPC and gas cost helpers."""
 
+import json
 import logging
 import os
 import time
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Dict
 
 import requests as _requests_mod
@@ -55,6 +57,14 @@ def fetch_daily_gas_prices(start_date: str, end_date: str) -> Dict[str, int]:
         Mapping of ``YYYY-MM-DD`` -> average ``baseFeePerGas`` in Wei (int).
         Empty dict on failure.
     """
+    override = os.environ.get("BACKTEST_GAS_PRICES_JSON")
+    if override:
+        path = Path(override)
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise RuntimeError(f"BACKTEST_GAS_PRICES_JSON must be a JSON object: {path}")
+        return {str(k): int(v) for k, v in raw.items() if not str(k).startswith("__")}
+
     try:
         head = _rpc_call("eth_getBlockByNumber", ["latest", False])
         head_number = int(head["number"], 16)

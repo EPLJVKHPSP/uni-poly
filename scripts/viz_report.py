@@ -13,7 +13,9 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
+
+PricingMode = Literal["exec", "mid"]
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -150,6 +152,134 @@ def _run_config_block(summary: Dict[str, Any]) -> str:
             sev = w.get("severity", "warning")
             lines.append(f"- [{sev}] {msg}")
     return "<br>".join(lines)
+
+
+def _exec_mid_roi_apy(summary: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """Resolve EXEC and MID ROI/APY (with auditable fallback for MID)."""
+    a = summary.get("active_strategy") or {}
+    investment = summary.get("investment_usd")
+    total_days = (summary.get("period") or {}).get("total_days")
+
+    exec_roi = a.get("roi_pct")
+    exec_apy = a.get("apy")
+
+    mid_cf = (summary.get("counterfactuals") or {}).get("db_mid_execution") or {}
+    mid_roi = mid_cf.get("roi_pct")
+    mid_apy = mid_cf.get("apy")
+    if mid_roi is None or mid_apy is None:
+        fv = a.get("final_value_usd")
+        spread_cost = a.get("total_spread_cost_usdc", 0.0)
+        slip_cost = a.get("total_slippage_cost_usdc", 0.0)
+        try:
+            mid_fv = float(fv) + float(spread_cost) + float(slip_cost)
+        except Exception:
+            mid_fv = None
+        if mid_fv is not None:
+            try:
+                mid_roi = (mid_fv / float(investment) - 1.0) * 100.0 if investment else None
+            except Exception:
+                mid_roi = None
+            mid_apy = _compute_apy(mid_fv, investment, total_days)
+
+    hodl = (summary.get("baselines") or {}).get("hodl") or {}
+    hodl_roi = hodl.get("roi_pct")
+    hodl_apy = hodl.get("apy")
+    if hodl_apy is None:
+        hodl_apy = _compute_apy(hodl.get("final_value_usd"), investment, total_days)
+
+    def _diff(a_: Optional[float], b_: Optional[float]) -> Optional[float]:
+        if a_ is None or b_ is None:
+            return None
+        return float(a_) - float(b_)
+
+    return {
+        "exec_roi": exec_roi,
+        "exec_apy": exec_apy,
+        "mid_roi": mid_roi,
+        "mid_apy": mid_apy,
+        "hodl_roi": hodl_roi,
+        "hodl_apy": hodl_apy,
+        "exec_vs_hodl_roi": _diff(exec_roi, hodl_roi),
+        "exec_vs_hodl_apy": _diff(exec_apy, hodl_apy),
+        "mid_vs_hodl_roi": _diff(mid_roi, hodl_roi),
+        "mid_vs_hodl_apy": _diff(mid_apy, hodl_apy),
+    }
+
+
+def _fmt_pp(v: Optional[float], places: int = 2) -> str:
+    """Format an ROI/APY *delta* in percentage points."""
+    if v is None:
+        return "—"
+    try:
+        return f"{float(v):+,.{places}f} pp"
+    except Exception:
+        return "—"
+
+
+def make_headline_roi_table(summary: Dict[str, Any]) -> go.Figure:
+    """Compact headline ROI/APY summary — the most important numbers, on top.
+
+    Two columns (EXEC / MID). The first row shows the *outperformance vs
+    HODL* (the bottom-line answer), then the strategy and HODL legs are
+    listed underneath for context."""
+    m = _exec_mid_roi_apy(summary)
+
+    def _cell(roi: Optional[float], apy: Optional[float]) -> str:
+        return f"{_fmt_pct(roi)} ROI · {_fmt_pct(apy)} APY"
+
+    def _cell_pp(roi: Optional[float], apy: Optional[float]) -> str:
+        return f"{_fmt_pp(roi)} ROI · {_fmt_pp(apy)} APY"
+
+    rows: List[Tuple[str, str, str]] = [
+        (
+            "<b>Strategy vs HODL</b>",
+            _cell_pp(m["exec_vs_hodl_roi"], m["exec_vs_hodl_apy"]),
+            _cell_pp(m["mid_vs_hodl_roi"], m["mid_vs_hodl_apy"]),
+        ),
+        (
+            "Strategy",
+            _cell(m["exec_roi"], m["exec_apy"]),
+            _cell(m["mid_roi"], m["mid_apy"]),
+        ),
+        (
+            "HODL baseline (initial 50/50)",
+            _cell(m["hodl_roi"], m["hodl_apy"]),
+            _cell(m["hodl_roi"], m["hodl_apy"]),
+        ),
+    ]
+
+    col0 = [r[0] for r in rows]
+    col1 = [r[1] for r in rows]
+    col2 = [r[2] for r in rows]
+
+    headline_color = ["rgb(248,250,252)"] * len(rows)
+    headline_color[0] = "rgb(232,243,232)"
+
+    fig = go.Figure(
+        data=[
+            go.Table(
+                header=dict(
+                    values=["", "<b>EXEC (with premium)</b>", "<b>MID (no premium)</b>"],
+                    fill_color="rgb(238,242,247)",
+                    line_color="rgb(220,220,220)",
+                    font=dict(size=13, color="rgb(20,30,40)"),
+                    height=32,
+                    align="left",
+                ),
+                cells=dict(
+                    values=[col0, col1, col2],
+                    align=["left", "right", "right"],
+                    fill_color=[headline_color, headline_color, headline_color],
+                    line_color="rgb(232,232,232)",
+                    font=dict(size=13, family="Inter, ui-sans-serif, system-ui"),
+                    height=30,
+                ),
+                columnwidth=[0.34, 0.33, 0.33],
+            )
+        ]
+    )
+    fig.update_layout(margin=dict(l=10, r=10, t=4, b=4), height=140)
+    return fig
 
 
 def make_summary_table(summary: Dict[str, Any]) -> go.Figure:
@@ -401,18 +531,84 @@ def make_balances_table(summary: Dict[str, Any]) -> go.Figure:
     return fig
 
 
-def make_rebalances_table(summary: Dict[str, Any]) -> go.Figure:
-    """Detailed per-position (rebalance) ledger."""
-    def _date_only(s: Any) -> str:
-        try:
-            return _dt_from_iso(str(s)).date().isoformat()
-        except Exception:
-            return ""
+def _position_duration_days(p: Dict[str, Any]) -> str:
+    """Hold period from open to close as a compact day count."""
+    try:
+        o = _dt_from_iso(str(p["open"]))
+        c = _dt_from_iso(str(p["close"]))
+        days = (c - o).total_seconds() / 86400.0
+        if days < 0.05:
+            return "<1d"
+        if days < 10:
+            return f"{days:.1f}d"
+        return f"{days:.0f}d"
+    except Exception:
+        return "—"
 
-    rows = []
-    positions = summary.get("positions") or []
+
+def _insurance_amounts(p: Dict[str, Any], pricing: PricingMode) -> Dict[str, float]:
+    """Insurance cashflows at EXEC or reconstructed MID prices."""
+    payout = _as_float(p.get("insurance_payout_usdc"))
+    buy_exec = _as_float(p.get("insurance_cost_usdc"))
+    sell_exec = _as_float(p.get("insurance_sellback_usdc"))
+    if pricing == "exec":
+        buy, sell = buy_exec, sell_exec
+    else:
+        buy = max(
+            0.0,
+            buy_exec
+            - _as_float(p.get("spread_cost_buy_usdc"))
+            - _as_float(p.get("slippage_cost_buy_usdc")),
+        )
+        sell = (
+            sell_exec
+            + _as_float(p.get("spread_cost_sell_usdc"))
+            + _as_float(p.get("slippage_cost_sell_usdc"))
+        )
+    return {"buy": buy, "sell": sell, "payout": payout, "net": payout + sell - buy}
+
+
+def _ins_pct_of_deposit(p: Dict[str, Any], ins_buy: float) -> Optional[float]:
+    deposit_usd = _as_float((p.get("deposit") or {}).get("value_usd"), default=None)
+    if deposit_usd and deposit_usd > 0:
+        return ins_buy / deposit_usd * 100.0
+    return None
+
+
+def _rebalance_table_headers(pricing: PricingMode) -> List[str]:
+    """Shared column layout for EXEC and MID trade lists (only insurance labels differ)."""
+    tag = "EXEC" if pricing == "exec" else "MID"
+    return [
+        "<b>#</b>",
+        "<b>Days</b>",
+        "<b>Why entered</b>",
+        "<b>Why closed</b>",
+        "<b>Range</b>",
+        "<b>Width</b>",
+        "<b>Buf ↓</b>",
+        "<b>Buf ↑</b>",
+        f"<b>Ins buy ({tag})</b>",
+        "<b>Ins / Dep</b>",
+        "<b>Ins payout</b>",
+        f"<b>Ins sell ({tag})</b>",
+        f"<b>Ins net ({tag})</b>",
+        "<b>Fees</b>",
+        "<b>IL</b>",
+        "<b>Δ Wallet</b>",
+    ]
+
+
+# Relative widths for the 15-column trade table (must sum ≈ 1.0).
+_REBALANCE_COL_WIDTHS: List[float] = [
+    0.03, 0.04, 0.08, 0.08, 0.09, 0.045, 0.045, 0.045,
+    0.075, 0.055, 0.065, 0.075, 0.075, 0.055, 0.055, 0.075,
+]
+
+
+def _rebalance_table_rows(summary: Dict[str, Any], pricing: PricingMode) -> List[Tuple[Any, ...]]:
+    rows: List[Tuple[Any, ...]] = []
     prev_reason: Optional[str] = None
-    for i, p in enumerate(positions, start=1):
+    for i, p in enumerate(summary.get("positions") or [], start=1):
         rng = p.get("range") or [None, None]
         mn = _as_float(rng[0], default=None)
         mx = _as_float(rng[1], default=None)
@@ -420,6 +616,8 @@ def make_rebalances_table(summary: Dict[str, Any]) -> go.Figure:
         trigger_short, _ = _entry_trigger(prev_reason, i)
         prev_reason = reason
         m = _position_entry_metrics(p)
+        ins = _insurance_amounts(p, pricing)
+        ins_pct = _ins_pct_of_deposit(p, ins["buy"])
 
         wb = p.get("wallet_before") or {}
         wa = p.get("wallet_after") or {}
@@ -428,48 +626,32 @@ def make_rebalances_table(summary: Dict[str, Any]) -> go.Figure:
         rows.append(
             (
                 i,
-                _date_only(p.get("open", "")),
-                _date_only(p.get("close", "")),
+                _position_duration_days(p),
                 trigger_short,
                 reason,
                 f"[{_fmt_num(mn, 0)}–{_fmt_num(mx, 0)}]" if mn is not None and mx is not None else "",
                 _fmt_pct(m["width_pct"], 1),
                 _fmt_pct(m["lower_buf_pct"], 1),
                 _fmt_pct(m["upper_buf_pct"], 1),
-                _fmt_money(p.get("entry_price")),
-                _fmt_money(p.get("close_price")),
-                _fmt_money(p.get("insurance_cost_usdc")),
-                _fmt_pct(m["ins_pct_of_deposit"], 2),
-                _fmt_money(p.get("insurance_payout_usdc")),
-                _fmt_money(p.get("insurance_sellback_usdc")),
+                _fmt_money(ins["buy"]),
+                _fmt_pct(ins_pct, 2),
+                _fmt_money(ins["payout"]),
+                _fmt_money(ins["sell"]),
+                _fmt_money(ins["net"]),
                 _fmt_money(p.get("fees_earned_usd")),
                 _fmt_money(p.get("il_usdc")),
                 _fmt_money(d_wallet),
             )
         )
+    return rows
 
-    headers = [
-        "<b>#</b>",
-        "<b>Open</b>",
-        "<b>Close</b>",
-        "<b>Why entered</b>",
-        "<b>Why closed</b>",
-        "<b>Range</b>",
-        "<b>Width</b>",
-        "<b>Buf ↓</b>",
-        "<b>Buf ↑</b>",
-        "<b>Entry $</b>",
-        "<b>Close $</b>",
-        "<b>Ins buy</b>",
-        "<b>Ins / Dep</b>",
-        "<b>Ins payout</b>",
-        "<b>Ins sell</b>",
-        "<b>Fees</b>",
-        "<b>IL</b>",
-        "<b>Δ Wallet (USD)</b>",
-    ]
 
+def make_rebalances_table(summary: Dict[str, Any], pricing: PricingMode = "exec") -> go.Figure:
+    """Per-position ledger; identical layout for EXEC and MID (insurance columns tagged)."""
+    headers = _rebalance_table_headers(pricing)
+    rows = _rebalance_table_rows(summary, pricing)
     cols = list(zip(*rows)) if rows else [tuple() for _ in headers]
+    n_rows = max(len(rows), 1)
 
     fig = go.Figure(
         data=[
@@ -480,128 +662,24 @@ def make_rebalances_table(summary: Dict[str, Any]) -> go.Figure:
                     line_color="rgb(220,220,220)",
                     font=dict(size=11),
                     height=28,
-                    align="center",
+                    align="left",
                 ),
                 cells=dict(
                     values=[list(c) for c in cols],
                     fill_color="white",
                     line_color="rgb(235,235,235)",
-                    font=dict(size=10),
-                    height=20,
-                    align="center",
+                    font=dict(size=10, family="Inter, ui-sans-serif, system-ui"),
+                    height=22,
+                    align="left",
                 ),
-                columnwidth=[
-                    0.025, 0.06, 0.06,
-                    0.075, 0.06,
-                    0.075, 0.04, 0.04, 0.04,
-                    0.05, 0.05,
-                    0.06, 0.05,
-                    0.06, 0.06,
-                    0.05, 0.05, 0.07,
-                ],
+                columnwidth=_REBALANCE_COL_WIDTHS,
             )
         ]
     )
-    fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=520)
-    return fig
-
-
-def make_rebalances_table_mid(summary: Dict[str, Any]) -> go.Figure:
-    """Per-position ledger reconstructed at MID prices (no premium/discount)."""
-    def _date_only(s: Any) -> str:
-        try:
-            return _dt_from_iso(str(s)).date().isoformat()
-        except Exception:
-            return ""
-
-    rows = []
-    for i, p in enumerate(summary.get("positions") or [], start=1):
-        rng = p.get("range") or [None, None]
-        mn = _as_float(rng[0], default=None)
-        mx = _as_float(rng[1], default=None)
-        reason = str(p.get("close_reason") or "")
-
-        # EXEC values stored in JSON
-        buy_exec = _as_float(p.get("insurance_cost_usdc"))
-        sell_exec = _as_float(p.get("insurance_sellback_usdc"))
-        payout = _as_float(p.get("insurance_payout_usdc"))
-
-        # Execution drag recorded separately; use it to reconstruct MID.
-        sp_buy = _as_float(p.get("spread_cost_buy_usdc"))
-        sl_buy = _as_float(p.get("slippage_cost_buy_usdc"))
-        sp_sell = _as_float(p.get("spread_cost_sell_usdc"))
-        sl_sell = _as_float(p.get("slippage_cost_sell_usdc"))
-
-        buy_mid = max(0.0, buy_exec - sp_buy - sl_buy)
-        sell_mid = sell_exec + sp_sell + sl_sell
-        net_mid = payout + sell_mid - buy_mid
-
-        wb = p.get("wallet_before") or {}
-        wa = p.get("wallet_after") or {}
-        d_wallet = _as_float(wa.get("value_usd")) - _as_float(wb.get("value_usd"))
-
-        rows.append(
-            (
-                i,
-                _date_only(p.get("open", "")),
-                _date_only(p.get("close", "")),
-                reason,
-                f"[{_fmt_num(mn, 0)}–{_fmt_num(mx, 0)}]" if mn is not None and mx is not None else "",
-                _fmt_money(p.get("entry_price")),
-                _fmt_money(p.get("close_price")),
-                _fmt_money(buy_mid),
-                _fmt_money(payout),
-                _fmt_money(sell_mid),
-                _fmt_money(net_mid),
-                _fmt_money(p.get("fees_earned_usd")),
-                _fmt_money(p.get("il_usdc")),
-                _fmt_money(d_wallet),
-            )
-        )
-
-    headers = [
-        "<b>#</b>",
-        "<b>Open</b>",
-        "<b>Close</b>",
-        "<b>Reason</b>",
-        "<b>Range</b>",
-        "<b>Entry</b>",
-        "<b>Close</b>",
-        "<b>Ins buy (MID)</b>",
-        "<b>Ins payout</b>",
-        "<b>Ins sell (MID)</b>",
-        "<b>Ins net (MID)</b>",
-        "<b>Fees</b>",
-        "<b>IL</b>",
-        "<b>Δ Wallet (USD)</b>",
-    ]
-
-    cols = list(zip(*rows)) if rows else [tuple() for _ in headers]
-
-    fig = go.Figure(
-        data=[
-            go.Table(
-                header=dict(
-                    values=headers,
-                    fill_color="rgb(245,245,245)",
-                    line_color="rgb(220,220,220)",
-                    font=dict(size=12),
-                    height=28,
-                    align="center",
-                ),
-                cells=dict(
-                    values=[list(c) for c in cols],
-                    fill_color="white",
-                    line_color="rgb(235,235,235)",
-                    font=dict(size=10),
-                    height=20,
-                    align="center",
-                ),
-                columnwidth=[0.04, 0.08, 0.08, 0.08, 0.08, 0.055, 0.055, 0.095, 0.075, 0.095, 0.095, 0.055, 0.055, 0.12],
-            )
-        ]
+    fig.update_layout(
+        margin=dict(l=4, r=4, t=6, b=6),
+        height=min(90 + 24 * n_rows, 680),
     )
-    fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=460)
     return fig
 
 
@@ -1050,21 +1128,77 @@ def make_positions_timeline_figure(positions: List[PositionEvent]) -> go.Figure:
     return fig
 
 
-def make_cumulative_pnl_figure(snaps: Dict[str, List[Any]], summary: Dict[str, Any]) -> go.Figure:
-    """Cumulative USD PnL of the strategy vs HODL, with the per-position
-    insurance net and LP fees broken out as supporting series.
+def _mid_strategy_curve(
+    xs: List[Any],
+    exec_strat: List[Optional[float]],
+    positions: List[Dict[str, Any]],
+) -> List[Optional[float]]:
+    """Reconstruct the MID-pricing strategy USD curve from the EXEC curve.
+
+    For each position, the spread + slippage drag on the *buy* leg is paid at
+    open-time and the drag on the *sell* leg is paid at close-time.  Adding the
+    cumulative drag back into the EXEC curve produces what the wallet would
+    have looked like if Polymarket execution were free."""
+    if not xs:
+        return list(exec_strat)
+
+    events: List[Tuple[datetime, float]] = []
+    for p in positions:
+        sp_buy = _as_float(p.get("spread_cost_buy_usdc"))
+        sl_buy = _as_float(p.get("slippage_cost_buy_usdc"))
+        sp_sell = _as_float(p.get("spread_cost_sell_usdc"))
+        sl_sell = _as_float(p.get("slippage_cost_sell_usdc"))
+        try:
+            o = _dt_from_iso(str(p["open"]))
+            events.append((o, sp_buy + sl_buy))
+        except Exception:
+            pass
+        try:
+            c = _dt_from_iso(str(p["close"]))
+            events.append((c, sp_sell + sl_sell))
+        except Exception:
+            pass
+    events.sort(key=lambda e: e[0])
+
+    out: List[Optional[float]] = []
+    j = 0
+    drag = 0.0
+    for x, exec_v in zip(xs, exec_strat):
+        while j < len(events) and events[j][0] <= x:
+            drag += events[j][1]
+            j += 1
+        if exec_v is None:
+            out.append(None)
+        else:
+            out.append(exec_v + drag)
+    return out
+
+
+def make_cumulative_pnl_figure(
+    snaps: Dict[str, List[Any]],
+    summary: Dict[str, Any],
+    pricing: PricingMode = "exec",
+) -> go.Figure:
+    """Cumulative USD PnL of the strategy vs HODL, decomposed into LP fees
+    and insurance net.
 
     All curves are zeroed at the first snapshot so the chart shows *change*
-    from initial capital. The per-position insurance and fee series are
-    plotted as cumulative sums anchored at each position close, which is
-    when those cashflows actually realised."""
+    from initial capital.  ``pricing="exec"`` (default) uses the realised
+    EXEC strategy and EXEC insurance cashflows; ``pricing="mid"`` rebuilds
+    the strategy curve and the cumulative insurance net from MID prices by
+    adding back the recorded execution drag."""
     xs = snaps["x"]
-    strat = snaps["strategy_usd"]
     hodl = snaps["hodl_usd"]
+    exec_strat = snaps["strategy_usd"]
+    positions = summary.get("positions") or []
+
+    if pricing == "exec":
+        strat = exec_strat
+    else:
+        strat = _mid_strategy_curve(xs, exec_strat, positions)
 
     inv_usd = _as_float(summary.get("investment_usd"))
     if not inv_usd:
-        # Fallback: anchor at the first finite strategy value.
         for v in strat:
             if v:
                 inv_usd = float(v)
@@ -1073,14 +1207,18 @@ def make_cumulative_pnl_figure(snaps: Dict[str, List[Any]], summary: Dict[str, A
     strat_pnl = [(v - inv_usd) if v is not None else None for v in strat]
     hodl_pnl = [(v - inv_usd) if v is not None else None for v in hodl]
 
+    tag = "EXEC" if pricing == "exec" else "MID"
+    strat_color = "rgb(31,119,180)" if pricing == "exec" else "rgb(148,103,189)"
+
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
             x=xs, y=strat_pnl,
-            name="Strategy PnL (LP + Polymarket)",
+            name=f"Strategy PnL ({tag})",
             mode="lines",
-            line=dict(color="rgb(31,119,180)", width=2.5),
-            hovertemplate="%{x|%Y-%m-%d %H:%M}<br>Strategy: $%{y:,.0f}<extra></extra>",
+            line=dict(color=strat_color, width=2.5),
+            hovertemplate="%{x|%Y-%m-%d %H:%M}<br>"
+                          f"Strategy ({tag}): " "$%{y:,.0f}<extra></extra>",
         )
     )
     fig.add_trace(
@@ -1093,8 +1231,6 @@ def make_cumulative_pnl_figure(snaps: Dict[str, List[Any]], summary: Dict[str, A
         )
     )
 
-    # Cumulative LP fees and insurance net, anchored at each position close.
-    positions = summary.get("positions") or []
     if positions:
         ins_x: List[Any] = []
         ins_y: List[float] = []
@@ -1107,7 +1243,11 @@ def make_cumulative_pnl_figure(snaps: Dict[str, List[Any]], summary: Dict[str, A
                 close_dt = _dt_from_iso(str(p["close"]))
             except Exception:
                 continue
-            ins_cum += _as_float(p.get("insurance_net_usdc"))
+            if pricing == "exec":
+                ins_cum += _as_float(p.get("insurance_net_usdc"))
+            else:
+                amt = _insurance_amounts(p, "mid")
+                ins_cum += amt["net"]
             fee_cum += _as_float(p.get("fees_earned_usd"))
             ins_x.append(close_dt)
             ins_y.append(ins_cum)
@@ -1117,11 +1257,12 @@ def make_cumulative_pnl_figure(snaps: Dict[str, List[Any]], summary: Dict[str, A
         fig.add_trace(
             go.Scatter(
                 x=ins_x, y=ins_y,
-                name="Cumulative insurance net (cost − payout − sellback)",
+                name=f"Cumulative insurance net ({tag})",
                 mode="lines+markers",
                 line=dict(color="rgb(214,39,40)", width=1.5),
                 marker=dict(size=4),
-                hovertemplate="%{x|%Y-%m-%d}<br>Cum insurance net: $%{y:,.0f}<extra></extra>",
+                hovertemplate="%{x|%Y-%m-%d}<br>"
+                              f"Cum insurance net ({tag}): " "$%{y:,.0f}<extra></extra>",
             )
         )
         fig.add_trace(
@@ -1137,7 +1278,7 @@ def make_cumulative_pnl_figure(snaps: Dict[str, List[Any]], summary: Dict[str, A
 
     fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="rgba(0,0,0,0.45)")
     fig.update_layout(
-        title="Cumulative PnL vs HODL — strategy decomposition",
+        title=f"Cumulative PnL vs HODL — {tag} pricing",
         legend_orientation="h",
         margin=dict(l=50, r=20, t=60, b=40),
         height=420,
@@ -1179,21 +1320,35 @@ def make_position_bars_figure(positions: List[PositionEvent]) -> go.Figure:
 
 def build_report(summary: Dict[str, Any], title: str) -> go.Figure:
     snaps = parse_snapshots(summary)
-    # 5 rows: balances + price/range + cumulative PnL + EXEC trade list + MID trade list.
+    token = summary.get("token_symbol", "ETH")
+
+    # Rows:
+    #   1 — Headline ROI/APY (EXEC vs MID, with vs-HODL outperformance on top)
+    #   2 — Balances + Cashflow
+    #   3 — Strategy Ranges Over Time
+    #   4 — Cumulative PnL Decomposition (EXEC)
+    #   5 — Cumulative PnL Decomposition (MID)
+    #   6 — Trade List (EXEC / with premium)
+    #   7 — Trade List (MID / no premium)
     fig = make_subplots(
-        rows=5,
+        rows=7,
         cols=1,
         shared_xaxes=False,
-        vertical_spacing=0.075,
+        vertical_spacing=0.045,
+        row_heights=[0.06, 0.16, 0.13, 0.13, 0.13, 0.195, 0.195],
         subplot_titles=(
+            "ROI / APY — Strategy vs HODL (EXEC and MID)",
             "Balances + Cashflow",
             "Strategy Ranges Over Time",
-            "Cumulative PnL Decomposition",
-            "Trade List (EXEC / with premium)",
-            "Trade List (MID / no premium)",
+            "Cumulative PnL Decomposition — EXEC (with premium)",
+            "Cumulative PnL Decomposition — MID (no premium)",
+            "Trade List — EXEC (with premium)",
+            "Trade List — MID (no premium)",
         ),
         specs=[
             [{"type": "table"}],
+            [{"type": "table"}],
+            [{"type": "xy"}],
             [{"type": "xy"}],
             [{"type": "xy"}],
             [{"type": "table"}],
@@ -1201,31 +1356,42 @@ def build_report(summary: Dict[str, Any], title: str) -> go.Figure:
         ],
     )
 
+    headline = make_headline_roi_table(summary)
+    for tr in headline.data:
+        fig.add_trace(tr, row=1, col=1)
+
     tbl = make_balances_table(summary)
     for tr in tbl.data:
-        fig.add_trace(tr, row=1, col=1)
+        fig.add_trace(tr, row=2, col=1)
 
     pr = make_price_and_range_figure(snaps, positions=summary.get("positions") or [])
     for tr in pr.data:
-        fig.add_trace(tr, row=2, col=1)
-
-    pnl = make_cumulative_pnl_figure(snaps, summary)
-    for tr in pnl.data:
         fig.add_trace(tr, row=3, col=1)
 
-    rtbl = make_rebalances_table(summary)
-    for tr in rtbl.data:
+    pnl_exec = make_cumulative_pnl_figure(snaps, summary, pricing="exec")
+    for tr in pnl_exec.data:
         fig.add_trace(tr, row=4, col=1)
 
-    rtbl_mid = make_rebalances_table_mid(summary)
-    for tr in rtbl_mid.data:
+    pnl_mid = make_cumulative_pnl_figure(snaps, summary, pricing="mid")
+    for tr in pnl_mid.data:
         fig.add_trace(tr, row=5, col=1)
 
-    # Global layout tuning
+    n_pos = len(summary.get("positions") or [])
+    table_panel_h = min(90 + 24 * max(n_pos, 1), 680)
+
+    rtbl = make_rebalances_table(summary, pricing="exec")
+    for tr in rtbl.data:
+        fig.add_trace(tr, row=6, col=1)
+
+    rtbl_mid = make_rebalances_table(summary, pricing="mid")
+    for tr in rtbl_mid.data:
+        fig.add_trace(tr, row=7, col=1)
+
     fig.update_layout(
         title=None,
-        height=2520,
+        height=2160 + 2 * table_panel_h,
         margin=dict(l=55, r=25, t=100, b=120),
+        showlegend=True,
         legend=dict(
             orientation="h",
             x=0.0,
@@ -1233,23 +1399,17 @@ def build_report(summary: Dict[str, Any], title: str) -> go.Figure:
             y=0.0,
             yanchor="top",
             entrywidthmode="fraction",
-            entrywidth=0.20,
+            entrywidth=0.22,
         ),
     )
     fig.update_annotations(yshift=18)
 
-    # Daily ticks on the two time-series rows
-    fig.update_xaxes(tickformat="%b %d", dtick=7 * 24 * 60 * 60 * 1000, tickangle=-45, row=2, col=1)
     fig.update_xaxes(tickformat="%b %d", dtick=7 * 24 * 60 * 60 * 1000, tickangle=-45, row=3, col=1)
-    fig.update_yaxes(title_text="USD per ETH", row=2, col=1)
-    fig.update_yaxes(title_text="USD (vs initial capital)", row=3, col=1)
-
-    # Place the shared legend just under the price chart (row 2).
-    try:
-        y0 = float(fig.layout.yaxis.domain[0])
-        fig.update_layout(legend=dict(y=y0 - 0.03))
-    except Exception:
-        pass
+    fig.update_xaxes(tickformat="%b %d", dtick=7 * 24 * 60 * 60 * 1000, tickangle=-45, row=4, col=1)
+    fig.update_xaxes(tickformat="%b %d", dtick=7 * 24 * 60 * 60 * 1000, tickangle=-45, row=5, col=1)
+    fig.update_yaxes(title_text=f"USD per {token}", row=3, col=1)
+    fig.update_yaxes(title_text="USD (vs initial capital)", row=4, col=1)
+    fig.update_yaxes(title_text="USD (vs initial capital)", row=5, col=1)
 
     return fig
 
@@ -1310,8 +1470,9 @@ def write_report_html(
           <b>{n_first}</b> first open · <b>{n_rebal_dn}</b> price-driven rebalance ↓ ·
           <b>{n_rebal_up}</b> price-driven rebalance ↑ · <b>{n_expired}</b> hedge-expiry rollovers ·
           <b>{n_other}</b> other.
-          See the <i>Why entered</i> column in the trade list and hover any
-          green entry marker on the price chart for the per-trade rationale.
+          See the <i>Why entered</i> and <i>Days</i> columns in the trade lists
+          (EXEC and MID share the same layout; only insurance prices differ).
+          Hover any green entry marker on the price chart for the per-trade rationale.
         </p>
       </div>"""
 
@@ -1333,7 +1494,7 @@ def write_report_html(
         color: #111827;
       }}
       .container {{
-        max-width: 1180px;
+        max-width: min(1440px, 96vw);
         margin: 0 auto;
       }}
       .page-title {{

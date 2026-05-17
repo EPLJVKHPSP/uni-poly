@@ -14,6 +14,7 @@ from .polymarket_execution import (
     SlippageConfig,
     apply_execution_costs,
     polymarket_taker_fee_usd,
+    slippage_per_contract_usd,
 )
 from .fee_math import (
     _tokens_for_strategy_human,
@@ -21,6 +22,223 @@ from .fee_math import (
     _liquidity_for_strategy,
 )
 from .gas import GAS_MINT, GAS_SWAP, GAS_BURN_COLLECT, gas_cost_usd
+
+
+# ---------------------------------------------------------------------------
+# Restore-to-anchor helpers
+# ---------------------------------------------------------------------------
+
+
+def restore_to_anchor_swap(
+    have_usdc: float,
+    have_eth: float,
+    anchor_usdc: float,
+    anchor_eth: float,
+    price: float,
+    swap_fee_rate: float,
+) -> Dict[str, float]:
+    """Swap on a Uniswap-like AMM to align (have_*) with (anchor_*) at ``price``.
+
+    The strategy's contract: end with **exactly anchor_eth ETH**, and any
+    surplus / deficit lands in USDC.
+
+    - When we have surplus ETH (touched lower / drifted up): sell the excess
+      ETH for USDC. Surplus USD lands in ``end_usdc - anchor_usdc`` (positive).
+    - When we lack ETH (touched upper / drifted down): buy ETH with USDC.
+      If the wallet doesn't have enough USDC to fully restore, we spend all
+      available USDC and end with ``end_eth < anchor_eth``; the deficit shows
+      up in ``unfilled_usd`` (negative).
+
+    Returns a dict::
+
+        {
+            "end_usdc": ...,
+            "end_eth": ...,
+            "swap_amount_usd": ...,   # absolute USD value swapped
+            "swap_fee_usd": ...,      # |swap_amount_usd| * swap_fee_rate
+            "unfilled_usd": ...,      # signed: > 0 surplus USD, < 0 deficit USD
+        }
+    """
+    have_usdc = float(have_usdc or 0.0)
+    have_eth = float(have_eth or 0.0)
+    anchor_usdc = float(anchor_usdc or 0.0)
+    anchor_eth = float(anchor_eth or 0.0)
+    price = float(price or 0.0)
+    fee_rate = max(float(swap_fee_rate or 0.0), 0.0)
+
+    if price <= 0.0:
+        # Cannot price the swap; refuse to swap and report deficit as USD diff.
+        anchor_value = anchor_usdc + anchor_eth * 0.0
+        have_value = have_usdc + have_eth * 0.0
+        return {
+            "end_usdc": have_usdc,
+            "end_eth": have_eth,
+            "swap_amount_usd": 0.0,
+            "swap_fee_usd": 0.0,
+            "unfilled_usd": have_value - anchor_value,
+        }
+
+    delta_eth = anchor_eth - have_eth
+
+    if abs(delta_eth) < 1e-12:
+        # Already at anchor in ETH terms; surplus/deficit is in USDC.
+        return {
+            "end_usdc": have_usdc,
+            "end_eth": anchor_eth,
+            "swap_amount_usd": 0.0,
+            "swap_fee_usd": 0.0,
+            "unfilled_usd": have_usdc - anchor_usdc,
+        }
+
+    if delta_eth > 0:
+        # Need more ETH: buy with USDC. To gain delta_eth ETH gross of fees,
+        # we must spend usdc_to_sell where eth_gained = usdc_to_sell*(1-f)/p
+        # (the AMM keeps `f` of every USDC fed in as the fee).
+        denom = (1.0 - fee_rate)
+        if denom <= 0.0:
+            usdc_to_sell = float("inf")
+        else:
+            usdc_to_sell = delta_eth * price / denom
+        if usdc_to_sell <= have_usdc:
+            end_usdc = have_usdc - usdc_to_sell
+            end_eth = anchor_eth
+            swap_fee = usdc_to_sell * fee_rate
+            return {
+                "end_usdc": end_usdc,
+                "end_eth": end_eth,
+                "swap_amount_usd": usdc_to_sell,
+                "swap_fee_usd": swap_fee,
+                "unfilled_usd": end_usdc - anchor_usdc,
+            }
+        # Insufficient USDC for full restore — spend all of it.
+        spend = max(have_usdc, 0.0)
+        eth_gained = (spend * (1.0 - fee_rate)) / price
+        end_eth = have_eth + eth_gained
+        end_usdc = 0.0
+        swap_fee = spend * fee_rate
+        end_value = end_usdc + end_eth * price
+        anchor_value = anchor_usdc + anchor_eth * price
+        return {
+            "end_usdc": end_usdc,
+            "end_eth": end_eth,
+            "swap_amount_usd": spend,
+            "swap_fee_usd": swap_fee,
+            "unfilled_usd": end_value - anchor_value,  # signed (negative = deficit)
+        }
+
+    # delta_eth < 0: excess ETH, sell for USDC. Pay fee on the USD value swapped.
+    eth_to_sell = -delta_eth
+    swap_amount = eth_to_sell * price
+    usdc_gained = swap_amount * (1.0 - fee_rate)
+    swap_fee = swap_amount * fee_rate
+    end_eth = anchor_eth
+    end_usdc = have_usdc + usdc_gained
+    return {
+        "end_usdc": end_usdc,
+        "end_eth": end_eth,
+        "swap_amount_usd": swap_amount,
+        "swap_fee_usd": swap_fee,
+        "unfilled_usd": end_usdc - anchor_usdc,
+    }
+
+
+def estimate_restore_cost_at_boundary(
+    *,
+    boundary_price: float,
+    boundary: str,                  # "lower" | "upper"
+    min_range: float,
+    max_range: float,
+    l_human: float,
+    anchor_usdc: float,
+    anchor_eth: float,
+    swap_fee_rate: float,
+    spread: float,
+    expected_lp_fee_credit_usd: float = 0.0,
+    estimated_close_gas_usd: float = 0.0,
+) -> float:
+    """USD value the touched-side hedge must deliver to fully restore the
+    anchor after a touch at ``boundary_price``.
+
+    Computed as::
+
+        gap_value          = anchor_value(boundary) - LP_value(boundary)
+        restore_swap_fee   ~= |delta_eth| * boundary_price * swap_fee_rate
+        sell_drag_per_$    ~= spread / 2 + estimate of slippage at touch (~0 ish)
+        restore_cost       = max(gap_value + restore_swap_fee + close_gas
+                                 - expected_lp_fee_credit_usd, 0)
+
+    The contract count needed to deliver this in payouts is solved iteratively
+    in ``open_position``.
+    """
+    bp = float(boundary_price)
+    if l_human <= 0.0 or bp <= 0.0:
+        return 0.0
+    wd_usdc, wd_eth = tokens_from_liquidity(bp, min_range, max_range, l_human)
+    lp_value = wd_usdc + wd_eth * bp
+    anchor_value = anchor_usdc + anchor_eth * bp
+    gap = anchor_value - lp_value  # positive = LP under HODL anchor at touch
+
+    # Approximate the restore swap fee. After the YES payout (USDC), we still
+    # must rebalance LP withdrawal back toward the anchor; the absolute swap
+    # size in ETH terms is |wd_eth - anchor_eth|.
+    delta_eth = abs(wd_eth - anchor_eth)
+    restore_swap_fee = delta_eth * bp * max(swap_fee_rate or 0.0, 0.0)
+
+    # Net cost the hedge must cover. Subtract any pre-credited LP fees the
+    # operator wants to bake in (default: 0 — fully fund with hedge).
+    cost = gap + restore_swap_fee + max(estimated_close_gas_usd, 0.0)
+    cost -= max(expected_lp_fee_credit_usd, 0.0)
+    return max(cost, 0.0)
+
+
+def _solve_contracts_for_payout(
+    *,
+    target_usd: float,
+    yes_mid: float,
+    spread: float,
+    slippage_cfg: Optional[SlippageConfig],
+    asset_id: Optional[str],
+    fee_model: Optional[PolymarketFeeModel],
+    touch_settlement_haircut: float,
+    iterations: int = 8,
+) -> float:
+    """Solve for ``contracts`` such that the touched-side payout ~= target_usd.
+
+    Approximates the realised payout per contract at touch as::
+
+        payout/contract ~= (1 - haircut) - spread/2 - slippage_per_contract(contracts)
+
+    Polymarket taker fees vanish near p=1 (since p*(1-p) -> 0), so we ignore
+    them in the touch payout estimate.
+
+    Returns the smallest positive ``contracts`` whose linear estimate clears
+    ``target_usd``. Falls back to 0 if no positive estimate is feasible.
+    """
+    target = max(float(target_usd or 0.0), 0.0)
+    if target <= 0.0:
+        return 0.0
+
+    # Initial guess: target / 1 (1$ per contract upper bound).
+    contracts = max(target, 1.0)
+    haircut = max(float(touch_settlement_haircut or 0.0), 0.0)
+    half_spread = max(float(spread or 0.0), 0.0) / 2.0
+    base_per = max(1.0 - haircut - half_spread, 0.0)
+    if base_per <= 0.0:
+        return 0.0
+
+    for _ in range(max(iterations, 1)):
+        slip_per = slippage_per_contract_usd(contracts, slippage_cfg, asset_id=asset_id)
+        payout_per = base_per - max(slip_per, 0.0)
+        if payout_per <= 1e-9:
+            # Slippage cap dominates — strategy can't restore via a bigger
+            # buy. Cap contracts using the previous iteration's value.
+            return contracts
+        new_contracts = target / payout_per
+        if abs(new_contracts - contracts) < 1e-3:
+            contracts = new_contracts
+            break
+        contracts = new_contracts
+    return max(contracts, 0.0)
 
 
 def _get_db_func(name):
@@ -48,8 +266,17 @@ def open_position(
     upper_clob_token_id: Optional[str] = None,
     lower_end_ts: Optional[int] = None,
     upper_end_ts: Optional[int] = None,
+    lower_market_volume: float = 0.0,
+    upper_market_volume: float = 0.0,
     fee_model: Optional[PolymarketFeeModel] = None,
     book_lookup: Optional[Callable[[Optional[str], int], Optional[Tuple[List, List]]]] = None,
+    bypass_insurance: bool = False,
+    # Restore-to-anchor extensions (defaults preserve legacy IL-only behaviour).
+    anchor_usdc: Optional[float] = None,
+    anchor_eth: Optional[float] = None,
+    hedge_sizing_mode: str = "il_only",      # or "full_restore"
+    hedge_lp_fee_credit_pct: float = 0.0,
+    touch_settlement_haircut: float = 0.0,
 ) -> Dict:
     """Open a position using the full wallet. Returns position record."""
     close_price = float(candle["close"])
@@ -115,46 +342,140 @@ def open_position(
     il_lower = calculate_il_at_price(entry_price, t0, t1, min_range, min_range, max_range)
     il_upper = calculate_il_at_price(entry_price, t0, t1, max_range, min_range, max_range)
 
-    lower_contracts = abs(min(0, il_lower["IL"]))
-    upper_contracts = abs(min(0, il_upper["IL"]))
+    # Recover the position's L_human up-front so the full-restore sizing can
+    # compute LP withdrawal at each boundary (using the same math as close).
+    l_human_pre = liquidity_from_tokens(entry_price, t0, t1, min_range, max_range)
 
-    # Compute insurance execution costs for the final contract sizes.
-    lower_bids, lower_asks = _book_for(lower_clob_token_id)
-    upper_bids, upper_asks = _book_for(upper_clob_token_id)
-    lower_exec_ask, lower_spread_cost, lower_slip_cost = apply_execution_costs(
-        mid_price=lower_mid,
-        spread=spread,
-        contracts=lower_contracts,
-        side="buy",
-        slippage_cfg=slippage_cfg,
-        asset_id=lower_clob_token_id,
-        fee_model=fee_model,
-        book_bids=lower_bids,
-        book_asks=lower_asks,
+    # Resolve anchor for restore-mode sizing.
+    use_anchor = (
+        hedge_sizing_mode == "full_restore"
+        and anchor_usdc is not None
+        and anchor_eth is not None
     )
-    upper_exec_ask, upper_spread_cost, upper_slip_cost = apply_execution_costs(
-        mid_price=upper_mid,
-        spread=spread,
-        contracts=upper_contracts,
-        side="buy",
-        slippage_cfg=slippage_cfg,
-        asset_id=upper_clob_token_id,
-        fee_model=fee_model,
-        book_bids=upper_bids,
-        book_asks=upper_asks,
-    )
-    book_used_open = bool(lower_asks) or bool(upper_asks)
+    anchor_usdc_eff = float(anchor_usdc) if use_anchor else float(t0)
+    anchor_eth_eff = float(anchor_eth) if use_anchor else float(t1)
 
-    lower_cost = lower_contracts * lower_exec_ask
-    upper_cost = upper_contracts * upper_exec_ask
-    total_insurance_cost = lower_cost + upper_cost
+    # Estimate close-side gas cost in USD for sizing the hedge. Use the same
+    # gas oracle that close_position will use; if data is missing this falls
+    # back to 0.
+    est_close_gas_usd = gas_cost_usd(GAS_BURN_COLLECT, ts, entry_price, gas_prices or {})
 
-    spread_cost_buy = lower_spread_cost + upper_spread_cost
-    slippage_cost_buy = lower_slip_cost + upper_slip_cost
-    fee_cost_buy = (
-        polymarket_taker_fee_usd(lower_contracts, lower_exec_ask, fee_model)
-        + polymarket_taker_fee_usd(upper_contracts, upper_exec_ask, fee_model)
-    )
+    if bypass_insurance:
+        # No-hedge LP: zero out every Polymarket-related cost. The position
+        # still has min/max_range so IL math, fees, and gas all keep working,
+        # but lower/upper_contracts are 0 so close_position naturally skips
+        # the YES sell branches.
+        lower_contracts = 0.0
+        upper_contracts = 0.0
+        lower_exec_ask = 0.0
+        upper_exec_ask = 0.0
+        lower_spread_cost = upper_spread_cost = 0.0
+        lower_slip_cost = upper_slip_cost = 0.0
+        book_used_open = False
+        lower_cost = upper_cost = 0.0
+        total_insurance_cost = 0.0
+        spread_cost_buy = 0.0
+        slippage_cost_buy = 0.0
+        fee_cost_buy = 0.0
+        restore_cost_lower = 0.0
+        restore_cost_upper = 0.0
+    else:
+        if hedge_sizing_mode == "full_restore":
+            restore_cost_lower = estimate_restore_cost_at_boundary(
+                boundary_price=min_range,
+                boundary="lower",
+                min_range=min_range,
+                max_range=max_range,
+                l_human=l_human_pre,
+                anchor_usdc=anchor_usdc_eff,
+                anchor_eth=anchor_eth_eff,
+                swap_fee_rate=swap_fee_rate,
+                spread=spread,
+                expected_lp_fee_credit_usd=0.0,  # LP fee credit applied below
+                estimated_close_gas_usd=est_close_gas_usd,
+            )
+            restore_cost_upper = estimate_restore_cost_at_boundary(
+                boundary_price=max_range,
+                boundary="upper",
+                min_range=min_range,
+                max_range=max_range,
+                l_human=l_human_pre,
+                anchor_usdc=anchor_usdc_eff,
+                anchor_eth=anchor_eth_eff,
+                swap_fee_rate=swap_fee_rate,
+                spread=spread,
+                expected_lp_fee_credit_usd=0.0,
+                estimated_close_gas_usd=est_close_gas_usd,
+            )
+            # Apply optional LP-fee credit (caller hints we expect to earn back
+            # X% of an IL-sized cushion via LP fees, so we under-hedge by that
+            # amount and pocket the premium savings).
+            credit_pct = max(min(float(hedge_lp_fee_credit_pct or 0.0), 1.0), 0.0)
+            if credit_pct > 0.0:
+                restore_cost_lower *= (1.0 - credit_pct)
+                restore_cost_upper *= (1.0 - credit_pct)
+
+            lower_contracts = _solve_contracts_for_payout(
+                target_usd=restore_cost_lower,
+                yes_mid=lower_mid,
+                spread=spread,
+                slippage_cfg=slippage_cfg,
+                asset_id=lower_clob_token_id,
+                fee_model=fee_model,
+                touch_settlement_haircut=touch_settlement_haircut,
+            )
+            upper_contracts = _solve_contracts_for_payout(
+                target_usd=restore_cost_upper,
+                yes_mid=upper_mid,
+                spread=spread,
+                slippage_cfg=slippage_cfg,
+                asset_id=upper_clob_token_id,
+                fee_model=fee_model,
+                touch_settlement_haircut=touch_settlement_haircut,
+            )
+        else:
+            restore_cost_lower = 0.0
+            restore_cost_upper = 0.0
+            lower_contracts = abs(min(0, il_lower["IL"]))
+            upper_contracts = abs(min(0, il_upper["IL"]))
+
+        # Compute insurance execution costs for the final contract sizes.
+        lower_bids, lower_asks = _book_for(lower_clob_token_id)
+        upper_bids, upper_asks = _book_for(upper_clob_token_id)
+        lower_exec_ask, lower_spread_cost, lower_slip_cost = apply_execution_costs(
+            mid_price=lower_mid,
+            spread=spread,
+            contracts=lower_contracts,
+            side="buy",
+            slippage_cfg=slippage_cfg,
+            asset_id=lower_clob_token_id,
+            fee_model=fee_model,
+            book_bids=lower_bids,
+            book_asks=lower_asks,
+        )
+        upper_exec_ask, upper_spread_cost, upper_slip_cost = apply_execution_costs(
+            mid_price=upper_mid,
+            spread=spread,
+            contracts=upper_contracts,
+            side="buy",
+            slippage_cfg=slippage_cfg,
+            asset_id=upper_clob_token_id,
+            fee_model=fee_model,
+            book_bids=upper_bids,
+            book_asks=upper_asks,
+        )
+        book_used_open = bool(lower_asks) or bool(upper_asks)
+
+        lower_cost = lower_contracts * lower_exec_ask
+        upper_cost = upper_contracts * upper_exec_ask
+        total_insurance_cost = lower_cost + upper_cost
+
+        spread_cost_buy = lower_spread_cost + upper_spread_cost
+        slippage_cost_buy = lower_slip_cost + upper_slip_cost
+        fee_cost_buy = (
+            polymarket_taker_fee_usd(lower_contracts, lower_exec_ask, fee_model)
+            + polymarket_taker_fee_usd(upper_contracts, upper_exec_ask, fee_model)
+        )
 
     token0_dep, token1_dep = _tokens_for_strategy_human(
         min_range, max_range, deposit_value, entry_price,
@@ -184,6 +505,8 @@ def open_position(
         "upper_clob_token_id": upper_clob_token_id,
         "lower_end_ts": lower_end_ts,
         "upper_end_ts": upper_end_ts,
+        "lower_market_volume": float(lower_market_volume or 0.0),
+        "upper_market_volume": float(upper_market_volume or 0.0),
         "wallet_before": {"usdc": wallet["usdc"], "eth": wallet["eth"], "value_usd": wallet_value},
         "deposit_value": deposit_value,
         "token0_dep": token0_dep,
@@ -209,6 +532,14 @@ def open_position(
         "accumulated_fees_usdc": 0.0,
         "accumulated_fees_eth": 0.0,
         "candle_count": 0,
+        # Restore-to-anchor metadata. anchor_* are always present (defaulting
+        # to the deposit split when restore mode is off) so close_position can
+        # uniformly compute the post-close swap when asked.
+        "anchor_usdc": anchor_usdc_eff,
+        "anchor_eth": anchor_eth_eff,
+        "hedge_sizing_mode": hedge_sizing_mode,
+        "restore_cost_lower": restore_cost_lower,
+        "restore_cost_upper": restore_cost_upper,
     }
 
 
@@ -229,6 +560,8 @@ def close_position(
     sell_touched_at_market: bool = False,
     fee_model: Optional[PolymarketFeeModel] = None,
     book_lookup: Optional[Callable[[Optional[str], int], Optional[Tuple[List, List]]]] = None,
+    restore_to_anchor: bool = False,
+    pool_swap_fee_rate: float = 0.0,
 ) -> Tuple[Dict, Dict]:
     """Settle a position. Returns (pos, new_wallet).
 
@@ -270,10 +603,15 @@ def close_position(
     get_historical_bet_price = _get_db_func("get_historical_bet_price")
 
     payout = 0.0
-    insurance_sellback = 0.0
-    spread_cost_sell = 0.0
-    slippage_cost_sell = 0.0
-    fee_cost_sell = 0.0
+    # Seed sell-side aggregates from anything the simulator accrued *before*
+    # close_position was invoked. The take-profit-on-insurance feature
+    # writes early-sell proceeds and frictions into ``pos`` mid-flight; we
+    # honour them here so the final tallies (insurance_sellback, spread,
+    # slippage, fee) include both the early-sold and at-close legs.
+    insurance_sellback = float(pos.get("insurance_sellback", 0.0) or 0.0)
+    spread_cost_sell = float(pos.get("spread_cost_sell", 0.0) or 0.0)
+    slippage_cost_sell = float(pos.get("slippage_cost_sell", 0.0) or 0.0)
+    fee_cost_sell = float(pos.get("polymarket_fee_sell", 0.0) or 0.0)
 
     book_used_close = {"flag": False}
 
@@ -460,5 +798,42 @@ def close_position(
         pos["close_reason"] = "upper"
     else:
         pos["close_reason"] = "period_end"
+
+    # ------------------------------------------------------------------
+    # Restore-to-anchor post-close swap.
+    # ------------------------------------------------------------------
+    # When restore_to_anchor is on we treat insurance proceeds (payout +
+    # sellback) as real USDC available for rebalancing, then swap on the
+    # pool toward the (anchor_usdc, anchor_eth) target. Surplus stays as
+    # USDC, deficit means the wallet sits below the anchor for the next
+    # round.
+    if restore_to_anchor and pos.get("anchor_usdc") is not None and pos.get("anchor_eth") is not None:
+        have_usdc = new_wallet_usdc + pos["insurance_payout"] + pos["insurance_sellback"]
+        have_eth = new_wallet_eth
+        anchor_value_at_touch = pos["anchor_usdc"] + pos["anchor_eth"] * touch_price
+        wallet_value_at_touch = have_usdc + have_eth * touch_price
+        restore = restore_to_anchor_swap(
+            have_usdc=have_usdc,
+            have_eth=have_eth,
+            anchor_usdc=pos["anchor_usdc"],
+            anchor_eth=pos["anchor_eth"],
+            price=touch_price,
+            swap_fee_rate=pool_swap_fee_rate,
+        )
+        pos["restore_swap_amount"] = restore["swap_amount_usd"]
+        pos["restore_swap_fee"] = restore["swap_fee_usd"]
+        pos["restore_unfilled_usd"] = restore["unfilled_usd"]
+        pos["wallet_at_close_pre_restore"] = {
+            "usdc": have_usdc,
+            "eth": have_eth,
+            "value_usd": wallet_value_at_touch,
+        }
+        pos["wallet_after_restore"] = {
+            "usdc": restore["end_usdc"],
+            "eth": restore["end_eth"],
+            "value_usd": restore["end_usdc"] + restore["end_eth"] * touch_price,
+        }
+        pos["wallet_vs_anchor_usd"] = wallet_value_at_touch - anchor_value_at_touch
+        return pos, {"usdc": restore["end_usdc"], "eth": restore["end_eth"]}
 
     return pos, {"usdc": new_wallet_usdc, "eth": new_wallet_eth}

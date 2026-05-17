@@ -6,7 +6,7 @@ import os
 import sys
 import math
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from il import tokens_from_liquidity, liquidity_from_tokens
 
@@ -20,17 +20,24 @@ from .data_validation import (
 )
 from .range_selection import (
     _map_wrapped_symbol,
+    detect_pool_orientation,
     _filter_ranges_for_price,
     pick_best_range,
     pick_best_range_by_sweep,
     _get_insurance_for_range,
 )
-from .positions import open_position, close_position
+from .positions import (
+    open_position,
+    close_position,
+    restore_to_anchor_swap,
+)
 from .polymarket_execution import (
     ClosePolicy,
     PolymarketFeeModel,
     SlippageConfig,
+    apply_execution_costs,
     choose_close_price,
+    polymarket_taker_fee_usd,
 )
 from .telemetry import TelemetrySink, new_run_id
 
@@ -45,6 +52,56 @@ def _get_db_func(name):
         return getattr(shim, name)
     import db_utils
     return getattr(db_utils, name)
+
+
+def _realized_vol_pct(
+    candles: List[Dict],
+    i_now: int,
+    lookback_hours: int,
+    *,
+    forecast_mode: str = "perfect",
+    price_token: int = 0,
+) -> Optional[float]:
+    """Return the realised stdev of hourly log-returns expressed as a percent.
+
+    ``forecast_mode = "perfect"`` peeks forward at ``[i_now, i_now+lookback)``
+    — a leaked-future signal used to establish a perfect-foresight upper bound.
+
+    ``forecast_mode = "trailing"`` looks backward at
+    ``[i_now-lookback, i_now)`` — the realisable, no-peek version.
+
+    Returns ``None`` if there aren't enough samples for the requested window
+    (e.g. at series boundaries).
+    """
+    import math
+    if lookback_hours < 2:
+        return None
+    if forecast_mode == "perfect":
+        lo, hi = i_now, i_now + int(lookback_hours)
+    elif forecast_mode == "trailing":
+        lo, hi = i_now - int(lookback_hours), i_now
+    else:
+        return None
+    if lo < 0 or hi > len(candles) or hi - lo < 2:
+        return None
+    closes = []
+    for c in candles[lo:hi]:
+        try:
+            cl = float(c["close"])
+            if price_token == 1:
+                cl = 1.0 / cl if cl else 0.0
+            if cl > 0:
+                closes.append(cl)
+        except (KeyError, TypeError, ValueError):
+            continue
+    if len(closes) < 2:
+        return None
+    log_rets = [math.log(closes[k] / closes[k - 1]) for k in range(1, len(closes))]
+    if len(log_rets) < 1:
+        return None
+    mean = sum(log_rets) / len(log_rets)
+    var = sum((r - mean) ** 2 for r in log_rets) / max(len(log_rets) - 1, 1)
+    return math.sqrt(var) * 100.0
 
 
 def _build_outcome_to_market_index(
@@ -217,6 +274,24 @@ def simulate(
     restrict_to_touch_markets: bool = False,
     polymarket_fee_category: str = "crypto",
     polymarket_fees_enabled: bool = True,
+    selection_cfg: Optional[Dict] = None,
+    restore_to_anchor: bool = False,
+    hedge_sizing_mode: str = "il_only",
+    hedge_lp_fee_credit_pct: float = 0.0,
+    final_restore_at_end: bool = False,
+    max_idle_hours: Optional[float] = None,
+    require_full_insurance: bool = False,
+    take_profit_yes_multiplier: Optional[float] = None,
+    vol_regime_toggle: bool = False,
+    vol_regime_threshold_pct: Optional[float] = None,
+    vol_regime_lookback_hours: int = 24,
+    vol_regime_forecast_mode: str = "perfect",
+    conditional_hedging: bool = False,
+    conditional_hedging_threshold_pct: Optional[float] = None,
+    conditional_hedging_lookback_hours: int = 168,
+    conditional_hedging_forecast_mode: str = "perfect",
+    symmetric_range_pct: Optional[float] = None,
+    alt_fee_uplift_pct: float = 0.0,
 ) -> Tuple[List[Dict], Dict]:
     """
     Walk through hourly candles with realistic wallet tracking.
@@ -224,7 +299,50 @@ def simulate(
     When *warmup_candles* and *all_candles* are provided, range selection uses
     a lookback sweep (insurance efficiency) instead of the heuristic scorer.
     Returns (positions, final_wallet, snapshots).
+
+    ``selection_cfg`` (optional) is forwarded to ``pick_best_range`` and
+    controls the experiment-matrix knobs (yes-cap, min hedge TTE, scoring
+    objective, fixed-width preference).  Defaults to None == legacy behaviour.
+
+    Restore-to-anchor knobs:
+
+    - ``restore_to_anchor``: when True, the wallet is rebalanced to a fixed
+      ``(anchor_usdc, anchor_eth)`` token split after every position close.
+      The anchor is captured at the first successful open (== the actual
+      tokens deployed into the LP) and threaded through every later round.
+      Implies ``hedge_sizing_mode = "full_restore"`` and
+      ``final_restore_at_end = True`` unless the caller explicitly overrides.
+    - ``hedge_sizing_mode``: ``"il_only"`` (legacy: contracts == |IL| at the
+      boundary) or ``"full_restore"`` (size contracts so the touched-side
+      payout fully covers IL + restore swap fee + close gas).
+    - ``hedge_lp_fee_credit_pct``: under-hedge by this fraction (0.0–1.0) on
+      the assumption that LP fees will partially offset IL.
+    - ``final_restore_at_end``: when True, run one more pool swap at
+      ``final_price`` to align the wallet with the anchor at the end of the
+      backtest window. Records ``final_restore_swap_fee`` and
+      ``final_unfilled_usd`` in the returned snapshots tail.
     """
+    # When restore_to_anchor is on, force the dependent knobs unless the
+    # caller already overrode them. This keeps the user-facing surface small
+    # (one switch is enough) while preserving the explicit-override path.
+    if restore_to_anchor:
+        if hedge_sizing_mode == "il_only":
+            hedge_sizing_mode = "full_restore"
+        # final_restore_at_end is a binary opt-in; default it ON in restore mode.
+        final_restore_at_end = True if not final_restore_at_end else final_restore_at_end
+        # Restore-to-anchor wants maximum token utilisation. Auto-enable the
+        # graceful filter relaxation in pick_best_range so the strategy stays
+        # active around month-boundaries when only the about-to-expire
+        # Polymarket market satisfies the YES-cap / TTE filters.
+        if selection_cfg is None:
+            selection_cfg = {}
+        selection_cfg.setdefault("relax_filters_when_empty", True)
+    # If the caller asked for a max-idle bound, also turn on filter relaxation
+    # so the buffer/cap/TTE filters don't keep us idle past the deadline.
+    if max_idle_hours is not None and float(max_idle_hours) > 0:
+        if selection_cfg is None:
+            selection_cfg = {}
+        selection_cfg.setdefault("relax_filters_when_empty", True)
     get_range_combinations = _get_db_func("get_range_combinations")
     get_clob_token_id = _get_db_func("get_clob_token_id")
     get_historical_bet_price = _get_db_func("get_historical_bet_price")
@@ -260,6 +378,13 @@ def simulate(
             per_asset_slippage = fit_all_assets(conn, asset_ids=None,
                                                  fallback_per_1k=float(slippage_per_1k_contracts or 0.0))
         except Exception as exc:
+            # Any SQL error leaves the connection in an aborted transaction state
+            # until we roll it back; the simulator continues even when slippage
+            # fitting is unavailable, so make sure downstream queries still work.
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             logger.warning("Per-asset slippage fit unavailable (%s); using flat per_1k_contracts.", exc)
 
     # Layer Probalytics-derived slippage on top: when both sources have a
@@ -400,6 +525,28 @@ def simulate(
     log = logger.info if not quiet else logger.debug
     pending_close: Optional[Dict] = None
     delta_matched_qty: Optional[Dict[str, float]] = None
+
+    # Idle-tracking for the optional max_idle_hours guarantee. ``idle_since_ts``
+    # is set when current_pos becomes None (after a close, or at run start) and
+    # cleared the moment a new position opens. Once (ts - idle_since_ts) crosses
+    # max_idle_hours we force the selector to fall back to a fully-relaxed
+    # filter set (buffer down to 0%, cap/TTE filters dropped) so the strategy
+    # always re-enters within the user-specified window.
+    max_idle_secs: Optional[float] = (
+        float(max_idle_hours) * 3600.0
+        if (max_idle_hours is not None and float(max_idle_hours) > 0)
+        else None
+    )
+    idle_since_ts: Optional[int] = int(candles[0]["periodStartUnix"]) if candles else None
+
+    # Restore-to-anchor state. ``anchor_*`` are populated AFTER the very first
+    # successful open (so they always reflect the actual tokens deployed into
+    # the pool, never the wallet's pre-LP layout). ``final_restore_*`` capture
+    # the end-of-run alignment swap.
+    anchor_usdc: Optional[float] = None
+    anchor_eth: Optional[float] = None
+    final_restore_record: Optional[Dict[str, float]] = None
+    pool_swap_fee_rate = float(pool_data.get("feeTier", 0) or 0) / 1_000_000.0
 
     if telemetry is not None:
         telemetry.emit(
@@ -563,6 +710,8 @@ def simulate(
                 sell_touched_at_market=sell_touched_at_market,
                 fee_model=fee_model,
                 book_lookup=book_lookup,
+                restore_to_anchor=restore_to_anchor,
+                pool_swap_fee_rate=pool_swap_fee_rate,
             )
             positions.append(current_pos)
             pending_close = None
@@ -624,6 +773,7 @@ def simulate(
             current_pos = None
             lower_clob_id = None
             upper_clob_id = None
+            idle_since_ts = ts
             _snap(ts, current_price, current_pos, wallet)
             if telemetry is not None and cooldown_hours > 0:
                 cooldown_start_ts = ts
@@ -642,8 +792,74 @@ def simulate(
             continue
 
         if current_pos is None:
+            # ----------------------------------------------------------------
+            # Vol-regime gating (Phase 30A / 30B).
+            # ----------------------------------------------------------------
+            # Both decisions depend on a single forecast of realised hourly
+            # volatility over the next/last N hours. Perfect-foresight mode
+            # uses the actual realised series — that's a theoretical upper
+            # bound, not a tradeable strategy. Trailing mode uses historical
+            # vol only, which is realisable.
+            _vol_skip_cycle = False
+            _vol_force_bypass = False
+            if vol_regime_toggle and vol_regime_threshold_pct is not None:
+                _v = _realized_vol_pct(
+                    all_candles or candles,
+                    (warmup_len + i) if (all_candles is not None and warmup_candles) else i,
+                    vol_regime_lookback_hours,
+                    forecast_mode=vol_regime_forecast_mode,
+                    price_token=price_token,
+                )
+                if _v is not None and _v > float(vol_regime_threshold_pct):
+                    _vol_skip_cycle = True
+            if conditional_hedging and conditional_hedging_threshold_pct is not None:
+                _v2 = _realized_vol_pct(
+                    all_candles or candles,
+                    (warmup_len + i) if (all_candles is not None and warmup_candles) else i,
+                    conditional_hedging_lookback_hours,
+                    forecast_mode=conditional_hedging_forecast_mode,
+                    price_token=price_token,
+                )
+                # Low forecast vol → cheap to go uninsured: force bypass.
+                # High forecast vol → keep the hedge (don't force bypass; selection_cfg default wins).
+                if _v2 is not None and _v2 <= float(conditional_hedging_threshold_pct):
+                    _vol_force_bypass = True
+            if _vol_skip_cycle:
+                # Sit out: don't open, just snapshot and idle.
+                if idle_since_ts is None:
+                    idle_since_ts = ts
+                _snap(ts, current_price, current_pos, wallet)
+                i += 1
+                continue
             range_method = None
-            if fixed_range is not None:
+            range_info: Optional[Dict[str, Any]] = None
+            # ----------------------------------------------------------------
+            # Beefy ConcLiq-style synthetic symmetric range (Phase 31).
+            # When ``symmetric_range_pct`` is set, build a fresh range as
+            #   [P * (1 - w/200), P * (1 + w/200)]
+            # at every open. This is the spec's
+            #   [tickFloor - positionWidth*tickSpacing, tickFloor + positionWidth*tickSpacing]
+            # behaviour, mapped to %-of-spot space (we don't simulate ticks
+            # directly). Requires bypass_insurance because we don't try to
+            # find a Polymarket combo to match a synthetic range.
+            # ----------------------------------------------------------------
+            if (
+                symmetric_range_pct is not None
+                and float(symmetric_range_pct) > 0.0
+                and bool(selection_cfg and selection_cfg.get("bypass_insurance"))
+            ):
+                w = float(symmetric_range_pct) / 100.0
+                mn = current_price * (1.0 - w / 2.0)
+                mx = current_price * (1.0 + w / 2.0)
+                insurance_info = {"lower_bet_price": 0.0, "upper_bet_price": 0.0}
+                lower_clob_id = None
+                upper_clob_id = None
+                lower_meta = upper_meta = None
+                lower_market_volume = upper_market_volume = 0.0
+                scorer_lower_id = scorer_upper_id = None
+                scorer_lower_end = scorer_upper_end = None
+                range_method = "symmetric_synthetic"
+            elif fixed_range is not None:
                 mn, mx = fixed_range
                 if mn >= current_price or mx <= current_price:
                     _snap(ts, current_price, current_pos, wallet)
@@ -711,7 +927,31 @@ def simulate(
                     token_symbol, conn, candle_ts=ts,
                     restrict_to_touch_markets=restrict_to_touch_markets,
                 ) if conn is not None else all_combos
-                range_info = pick_best_range(combos_at_ts, current_price, token_symbol, ts, investment, conn)
+                range_info = pick_best_range(
+                    combos_at_ts, current_price, token_symbol, ts, investment, conn,
+                    selection_cfg=selection_cfg,
+                )
+                # max_idle_hours guarantee: if we've been idle longer than the
+                # caller's deadline, force a fully-relaxed re-pick so we never
+                # exceed the bound. Drops buffer/cap/TTE filters entirely and
+                # picks the cheapest YES-cap-passing range that contains
+                # current_price (or any range that contains it).
+                if (
+                    range_info is None
+                    and max_idle_secs is not None
+                    and idle_since_ts is not None
+                    and (ts - idle_since_ts) >= max_idle_secs
+                ):
+                    forced_cfg = dict(selection_cfg or {})
+                    forced_cfg["relax_filters_when_empty"] = True
+                    forced_cfg["range_buffer_pct"] = 0.0
+                    forced_cfg["range_max_width_pct"] = 200.0
+                    forced_cfg["range_yes_cap"] = 0.99
+                    forced_cfg["min_hedge_tte_hours"] = None
+                    range_info = pick_best_range(
+                        combos_at_ts, current_price, token_symbol, ts, investment, conn,
+                        selection_cfg=forced_cfg,
+                    )
                 if range_info is None:
                     _snap(ts, current_price, current_pos, wallet)
                     i += 1
@@ -739,12 +979,79 @@ def simulate(
             # Resolve Polymarket markets (and expiries) for this position
             # *before* opening so that per-asset slippage and the book
             # lookup (when armed) actually fire on the buy leg.
+            #
+            # Depth-aware selection priority:
+            #   1. Use the markets the scorer already chose (they're the
+            #      deepest-yet-cap-passing candidates per leg). This is
+            #      the only path where leg pricing and leg execution
+            #      actually agree, which matters because the scorer
+            #      already paid the premium-side cost in the YES it
+            #      reported and we now need to charge spread/slippage
+            #      against that exact same market's depth.
+            #   2. Fall back to a fresh ``get_candidate_markets`` lookup
+            #      (also depth-DESC ordered) for paths that don't go
+            #      through the scorer (fixed_range / lookback sweep).
+            _sel_cfg = selection_cfg or {}
+            _restrict_touch = bool(_sel_cfg.get("restrict_to_touch_markets", restrict_to_touch_markets))
+            _min_vol = float(_sel_cfg.get("min_market_volume", 0.0) or 0.0)
+
+            def _candidates(level, direction):
+                if conn is None:
+                    return []
+                try:
+                    return get_candidate_markets(
+                        token_symbol, level, direction, "Yes", conn, candle_ts=ts,
+                        restrict_to_touch_markets=_restrict_touch,
+                        min_market_volume=_min_vol,
+                    )
+                except TypeError:
+                    return get_candidate_markets(token_symbol, level, direction, "Yes", conn, candle_ts=ts)
+                except Exception:
+                    return []
+
+            # 1) Prefer the leg ids the scorer already locked in.
+            scorer_lower_id = None
+            scorer_upper_id = None
+            scorer_lower_vol = 0.0
+            scorer_upper_vol = 0.0
+            scorer_lower_end = None
+            scorer_upper_end = None
+            if range_info is not None and isinstance(range_info, dict):
+                scorer_lower_id = range_info.get("lower_clob_token_id")
+                scorer_upper_id = range_info.get("upper_clob_token_id")
+                scorer_lower_vol = float(range_info.get("lower_market_volume") or 0.0)
+                scorer_upper_vol = float(range_info.get("upper_market_volume") or 0.0)
+                _le = range_info.get("lower_end_ts")
+                _ue = range_info.get("upper_end_ts")
+                if _le is not None:
+                    try:
+                        scorer_lower_end = int(_le)
+                    except (TypeError, ValueError):
+                        scorer_lower_end = None
+                if _ue is not None:
+                    try:
+                        scorer_upper_end = int(_ue)
+                    except (TypeError, ValueError):
+                        scorer_upper_end = None
+
+            # 2) Fallback resolution path (used by fixed_range / lookback /
+            # any leg the scorer didn't fill in).
             lower_meta = None
             upper_meta = None
-            if conn is not None:
+            if not scorer_lower_id or not scorer_upper_id:
                 try:
-                    lower_cands = get_candidate_markets(token_symbol, mn, "down", "Yes", conn, candle_ts=ts)
-                    upper_cands = get_candidate_markets(token_symbol, mx, "up", "Yes", conn, candle_ts=ts)
+                    lower_cands = _candidates(mn, "down") if not scorer_lower_id else []
+                    upper_cands = _candidates(mx, "up") if not scorer_upper_id else []
+                    if not lower_cands and not scorer_lower_id and _min_vol > 0:
+                        lower_cands = get_candidate_markets(
+                            token_symbol, mn, "down", "Yes", conn, candle_ts=ts,
+                            restrict_to_touch_markets=_restrict_touch, min_market_volume=0.0,
+                        ) if conn is not None else []
+                    if not upper_cands and not scorer_upper_id and _min_vol > 0:
+                        upper_cands = get_candidate_markets(
+                            token_symbol, mx, "up", "Yes", conn, candle_ts=ts,
+                            restrict_to_touch_markets=_restrict_touch, min_market_volume=0.0,
+                        ) if conn is not None else []
                     lower_meta = lower_cands[0] if lower_cands else None
                     upper_meta = upper_cands[0] if upper_cands else None
                 except Exception:
@@ -760,12 +1067,52 @@ def simulate(
                 except Exception:
                     return None
 
-            lower_clob_id = (lower_meta or {}).get("clob_token_id") or (
-                get_clob_token_id(token_symbol, mn, "down", "Yes", conn, candle_ts=ts) if conn else None
-            )
-            upper_clob_id = (upper_meta or {}).get("clob_token_id") or (
-                get_clob_token_id(token_symbol, mx, "up", "Yes", conn, candle_ts=ts) if conn else None
-            )
+            def _vol(meta):
+                if not meta:
+                    return 0.0
+                try:
+                    return float(meta.get("market_volume") or 0.0)
+                except Exception:
+                    return 0.0
+
+            def _clob_fallback(level, direction):
+                if conn is None:
+                    return None
+                try:
+                    return get_clob_token_id(
+                        token_symbol, level, direction, "Yes", conn, candle_ts=ts,
+                        restrict_to_touch_markets=_restrict_touch,
+                        min_market_volume=_min_vol,
+                    )
+                except TypeError:
+                    return get_clob_token_id(token_symbol, level, direction, "Yes", conn, candle_ts=ts)
+
+            lower_clob_id = scorer_lower_id or (lower_meta or {}).get("clob_token_id") or _clob_fallback(mn, "down")
+            upper_clob_id = scorer_upper_id or (upper_meta or {}).get("clob_token_id") or _clob_fallback(mx, "up")
+            lower_market_volume = scorer_lower_vol if scorer_lower_id else _vol(lower_meta)
+            upper_market_volume = scorer_upper_vol if scorer_upper_id else _vol(upper_meta)
+
+            # Plumb depth-aware per-asset slippage into the existing
+            # SlippageConfig so apply_execution_costs uses a smaller
+            # per_1k for deeper markets and a larger one for ghost
+            # markets. Only set when no real Probalytics fit overrides
+            # this asset, so live data still wins when present.
+            try:
+                ref_depth = 100_000.0
+                slip_floor, slip_cap = 0.005, 0.20
+                slip_default = float(slippage_per_1k or 0.02)
+
+                def _depth_per_1k(volume_usd: float) -> float:
+                    v = max(float(volume_usd or 0.0), 1.0)
+                    scaled = slip_default * (ref_depth / v) ** 0.5
+                    return max(min(scaled, slip_cap), slip_floor)
+
+                if lower_clob_id and lower_clob_id not in slippage_cfg.per_asset:
+                    slippage_cfg.per_asset[str(lower_clob_id)] = _depth_per_1k(lower_market_volume)
+                if upper_clob_id and upper_clob_id not in slippage_cfg.per_asset:
+                    slippage_cfg.per_asset[str(upper_clob_id)] = _depth_per_1k(upper_market_volume)
+            except Exception:
+                pass
 
             # Publish (asset, strike) into the shared book_meta dict so the
             # strike-date proxy fallback inside book_lookup can resolve a
@@ -779,6 +1126,9 @@ def simulate(
             except Exception:
                 pass
 
+            _bypass = bool(selection_cfg and selection_cfg.get("bypass_insurance"))
+            if _vol_force_bypass:
+                _bypass = True
             current_pos = open_position(
                 candle,
                 pool_data,
@@ -790,17 +1140,70 @@ def simulate(
                 gas_prices=gas_prices,
                 spread=spread,
                 slippage_cfg=slippage_cfg,
-                lower_clob_token_id=lower_clob_id,
-                upper_clob_token_id=upper_clob_id,
-                lower_end_ts=_end_ts(lower_meta),
-                upper_end_ts=_end_ts(upper_meta),
+                lower_clob_token_id=None if _bypass else lower_clob_id,
+                upper_clob_token_id=None if _bypass else upper_clob_id,
+                lower_end_ts=None if _bypass else (scorer_lower_end if scorer_lower_id else _end_ts(lower_meta)),
+                upper_end_ts=None if _bypass else (scorer_upper_end if scorer_upper_id else _end_ts(upper_meta)),
+                lower_market_volume=0.0 if _bypass else lower_market_volume,
+                upper_market_volume=0.0 if _bypass else upper_market_volume,
                 fee_model=fee_model,
                 book_lookup=book_lookup,
+                bypass_insurance=_bypass,
+                anchor_usdc=anchor_usdc,
+                anchor_eth=anchor_eth,
+                hedge_sizing_mode=hedge_sizing_mode,
+                hedge_lp_fee_credit_pct=hedge_lp_fee_credit_pct,
+                touch_settlement_haircut=touch_settlement_haircut,
             )
             if current_pos is None:
                 _snap(ts, current_price, current_pos, wallet)
                 i += 1
                 continue
+
+            # require_full_insurance: refuse to open if either leg ended up with
+            # zero contracts (e.g. full_restore + LP-fee-credit drove restore_cost
+            # to 0, or _solve_contracts_for_payout couldn't size against thin
+            # books). The position is dropped, wallet is untouched, and we
+            # continue idling so the max_idle_hours guard can re-pick a deeper
+            # market on the next candle.
+            if (
+                require_full_insurance
+                and not _bypass
+                and (
+                    float(current_pos.get("lower_contracts") or 0.0) <= 0.0
+                    or float(current_pos.get("upper_contracts") or 0.0) <= 0.0
+                )
+            ):
+                log(
+                    f"  >> SKIP OPEN @ ${current_price:.0f} | "
+                    f"{datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')}: "
+                    f"insurance=$0 (lower={current_pos.get('lower_contracts'):.0f}, "
+                    f"upper={current_pos.get('upper_contracts'):.0f}) — "
+                    f"require_full_insurance is on"
+                )
+                current_pos = None
+                lower_clob_id = None
+                upper_clob_id = None
+                _snap(ts, current_price, current_pos, wallet)
+                i += 1
+                continue
+
+            # Position successfully opened — clear the idle-tracker so the next
+            # close starts a fresh max_idle window.
+            idle_since_ts = None
+
+            # Capture the anchor at the very first successful open so every
+            # later round (and the end-of-run final restore) targets the same
+            # token split. This is the actual (X USDC, Y ETH) deployed into
+            # the pool — not the user-supplied initial_eth which was settled
+            # via _required_usdc_for_eth above.
+            if anchor_usdc is None or anchor_eth is None:
+                anchor_usdc = float(current_pos["token0_dep"])
+                anchor_eth = float(current_pos["token1_dep"])
+                # Backfill onto the first position record so build_summary can
+                # surface the same numbers without recomputing.
+                current_pos["anchor_usdc"] = anchor_usdc
+                current_pos["anchor_eth"] = anchor_eth
 
             wb = current_pos['wallet_before']
             method_tag = f" ({range_method})" if range_method else ""
@@ -856,15 +1259,151 @@ def simulate(
             price_low, price_high = price_high, price_low
 
         if i > 0:
+            try:
+                pool_L = float(candle.get("liquidity") or 0.0)
+            except (TypeError, ValueError):
+                pool_L = 0.0
+            pool_L_arg: Optional[float] = pool_L if pool_L > 0 else None
             f_usdc, f_eth = compute_hourly_fee_split(
                 candle, candles[i - 1],
                 current_pos["liquidity"],
                 current_pos["min_range"], current_pos["max_range"],
                 dec0, dec1, price_token,
+                pool_active_liquidity=pool_L_arg,
             )
+            # Phase 31 — Beefy ConcLiq alt-position fee uplift.
+            # The reference design deploys a *second* one-sided LP on the
+            # heavier-inventory side after the main fill. That second
+            # position earns fees concurrently with the main one whenever
+            # spot is inside the alt range — effectively boosting strategy
+            # fees by ~10-25% in a trending market. We don't simulate the
+            # alt range explicitly (it would need a second active-liquidity
+            # state machine); instead we apply a flat percent uplift on the
+            # main-range fees as a calibrated approximation.
+            if alt_fee_uplift_pct and alt_fee_uplift_pct > 0:
+                _mult = 1.0 + float(alt_fee_uplift_pct) / 100.0
+                f_usdc *= _mult
+                f_eth *= _mult
             current_pos["accumulated_fees_usdc"] += f_usdc
             current_pos["accumulated_fees_eth"] += f_eth
             current_pos["candle_count"] += 1
+            our_L = float(current_pos.get("liquidity") or 0.0)
+            if pool_L > 0 and our_L > 0:
+                dil = pool_L / (pool_L + our_L)
+                current_pos["dilution_factor_sum"] = current_pos.get("dilution_factor_sum", 0.0) + dil
+                current_pos["dilution_sample_count"] = current_pos.get("dilution_sample_count", 0) + 1
+                current_pos["pool_L_sample_sum"] = current_pos.get("pool_L_sample_sum", 0.0) + pool_L
+                current_pos["our_L_share_sum"] = current_pos.get("our_L_share_sum", 0.0) + (our_L / (pool_L + our_L))
+
+        # ------------------------------------------------------------------
+        # Take-profit on insurance legs (optional).
+        # ------------------------------------------------------------------
+        # Hypothesis: the YES legs we bought as IL insurance are themselves
+        # tradeable. Each hour we mark-to-market each open leg at the current
+        # bid (less spread, slippage, taker fee). If sell-side proceeds for
+        # a leg are >= ``take_profit_yes_multiplier`` * what we paid for it,
+        # we close that leg early and the position continues *unhedged* on
+        # that side until LP touch/expiry.
+        #
+        # Costs/fees of the early sell are accumulated into the position's
+        # existing sell-side cost fields so build_summary sees a consistent
+        # picture; proceeds accumulate into ``insurance_sellback`` which
+        # close_position adds to at the end.
+        if (
+            take_profit_yes_multiplier is not None
+            and float(take_profit_yes_multiplier) > 0
+            and (
+                current_pos.get("lower_clob_token_id") is not None
+                or current_pos.get("upper_clob_token_id") is not None
+            )
+        ):
+            K = float(take_profit_yes_multiplier)
+            for side, clob_key, contracts_key, cost_key in (
+                ("lower", "lower_clob_token_id", "lower_contracts", "lower_insurance_cost_usdc"),
+                ("upper", "upper_clob_token_id", "upper_contracts", "upper_insurance_cost_usdc"),
+            ):
+                contracts = float(current_pos.get(contracts_key, 0) or 0)
+                cost_paid = float(current_pos.get(cost_key, 0) or 0)
+                clob_id = current_pos.get(clob_key)
+                if contracts <= 0 or cost_paid <= 0 or not clob_id or conn is None:
+                    continue
+                # Prefer the same execution path close_position uses: L2 book
+                # via book_lookup, falling back to parametric mid. This keeps
+                # the TP check honest — we'd see the same book a real operator
+                # would when deciding to take profit.
+                bids_for_sell = None
+                asks_for_sell = None
+                if book_lookup is not None:
+                    try:
+                        _bk = book_lookup(clob_id, ts)
+                    except Exception:
+                        _bk = None
+                    if _bk:
+                        bids_for_sell, asks_for_sell = _bk[0], _bk[1]
+                if bids_for_sell:
+                    mid_for_call = (
+                        float(bids_for_sell[0]["price"])
+                        if isinstance(bids_for_sell[0], dict)
+                        else float(bids_for_sell[0][0])
+                    )
+                else:
+                    try:
+                        mid_for_call = get_historical_bet_price(clob_id, ts, conn)
+                    except Exception:
+                        mid_for_call = None
+                if mid_for_call is None or mid_for_call <= 0:
+                    continue
+                try:
+                    bid_exec, sp_cost, sl_cost = apply_execution_costs(
+                        mid_price=float(mid_for_call),
+                        spread=spread,
+                        contracts=contracts,
+                        side="sell",
+                        slippage_cfg=slippage_cfg,
+                        asset_id=clob_id,
+                        fee_model=fee_model,
+                        book_bids=bids_for_sell,
+                        book_asks=asks_for_sell,
+                    )
+                except Exception:
+                    continue
+                if bid_exec <= 0:
+                    continue
+                proceeds = contracts * bid_exec
+                if proceeds < K * cost_paid:
+                    continue
+                fee = polymarket_taker_fee_usd(contracts, bid_exec, fee_model)
+                # Record early sellback into the position record. close_position
+                # will add the proceeds into the wallet at close (external-cost
+                # accounting parity); spread/slippage/fee are sunk friction
+                # already netted in ``bid_exec`` * ``contracts``.
+                current_pos["insurance_sellback"] = (
+                    float(current_pos.get("insurance_sellback", 0.0) or 0.0) + proceeds
+                )
+                current_pos["spread_cost_sell"] = (
+                    float(current_pos.get("spread_cost_sell", 0.0) or 0.0) + sp_cost
+                )
+                current_pos["slippage_cost_sell"] = (
+                    float(current_pos.get("slippage_cost_sell", 0.0) or 0.0) + sl_cost
+                )
+                current_pos["polymarket_fee_sell"] = (
+                    float(current_pos.get("polymarket_fee_sell", 0.0) or 0.0) + fee
+                )
+                # Track that this leg was sold early so close_position skips it.
+                # Mutating contracts to 0 is enough; the close_position code
+                # paths all gate on ``contracts > 0``.
+                current_pos[contracts_key] = 0.0
+                early_log_key = f"{side}_early_sold_ts"
+                if early_log_key not in current_pos:
+                    current_pos[early_log_key] = ts
+                    current_pos[f"{side}_early_proceeds"] = proceeds
+                    current_pos[f"{side}_early_buy_cost"] = cost_paid
+                    log(
+                        f"  >> TAKE PROFIT ({side.upper()}) @ ${current_price:.0f} | "
+                        f"{datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')}: "
+                        f"bid_exec=${bid_exec:.4f}/c × {contracts:,.0f}c = ${proceeds:,.0f}  "
+                        f"(buy_cost=${cost_paid:,.0f}, mult={proceeds/cost_paid:.2f}x ≥ {K:.2f}x)"
+                    )
 
         # Insurance expiry: if either market has reached end_date, force-close the position
         # and treat remaining insurance value as $0 (per project assumption).
@@ -889,6 +1428,8 @@ def simulate(
                 expired=True,
                 fee_model=fee_model,
                 book_lookup=book_lookup,
+                restore_to_anchor=restore_to_anchor,
+                pool_swap_fee_rate=pool_swap_fee_rate,
             )
             positions.append(current_pos)
             wa = current_pos["wallet_after"]
@@ -900,6 +1441,7 @@ def simulate(
             current_pos = None
             lower_clob_id = None
             upper_clob_id = None
+            idle_since_ts = ts
             _snap(ts, current_price, current_pos, wallet)
             i += 1 + cooldown_hours
             continue
@@ -945,6 +1487,8 @@ def simulate(
                 sell_touched_at_market=sell_touched_at_market,
                 fee_model=fee_model,
                 book_lookup=book_lookup,
+                restore_to_anchor=restore_to_anchor,
+                pool_swap_fee_rate=pool_swap_fee_rate,
             )
             positions.append(current_pos)
 
@@ -1001,6 +1545,7 @@ def simulate(
             current_pos = None
             lower_clob_id = None
             upper_clob_id = None
+            idle_since_ts = ts
             _snap(ts, current_price, current_pos, wallet)
             if telemetry is not None and cooldown_hours > 0:
                 cooldown_start_ts = ts
@@ -1031,6 +1576,8 @@ def simulate(
             sell_touched_at_market=sell_touched_at_market,
             fee_model=fee_model,
             book_lookup=book_lookup,
+            restore_to_anchor=restore_to_anchor,
+            pool_swap_fee_rate=pool_swap_fee_rate,
         )
         positions.append(current_pos)
         sb = current_pos.get('insurance_sellback', 0)
@@ -1080,6 +1627,60 @@ def simulate(
                 },
             )
 
+    # ------------------------------------------------------------------
+    # End-of-run final restore swap (restore-to-anchor mode only).
+    # ------------------------------------------------------------------
+    # After the last close (or directly if no position ever opened) align the
+    # wallet with the anchor at ``final_price``. Surplus stays as USDC,
+    # deficit means we end below the anchor and the unfilled amount is the
+    # final loss vs the X USDC + Y ETH target.
+    final_price_for_restore = (
+        float(candles[-1]["close"]) if price_token == 0 else 1.0 / float(candles[-1]["close"])
+    )
+    if (
+        final_restore_at_end
+        and anchor_usdc is not None
+        and anchor_eth is not None
+    ):
+        restore = restore_to_anchor_swap(
+            have_usdc=wallet["usdc"],
+            have_eth=wallet["eth"],
+            anchor_usdc=anchor_usdc,
+            anchor_eth=anchor_eth,
+            price=final_price_for_restore,
+            swap_fee_rate=pool_swap_fee_rate,
+        )
+        anchor_value_at_final = anchor_usdc + anchor_eth * final_price_for_restore
+        wallet_value_pre = wallet["usdc"] + wallet["eth"] * final_price_for_restore
+        wallet["usdc"] = restore["end_usdc"]
+        wallet["eth"] = restore["end_eth"]
+        final_restore_record = {
+            "ts": int(candles[-1]["periodStartUnix"]),
+            "price": float(final_price_for_restore),
+            "wallet_pre": {
+                "usdc": float(wallet_value_pre - wallet["eth"] * final_price_for_restore),
+                "eth": float(wallet["eth"] + (wallet_value_pre - wallet["usdc"]) * 0.0),
+            },
+            "anchor_value_at_final_usd": float(anchor_value_at_final),
+            "swap_amount_usd": float(restore["swap_amount_usd"]),
+            "swap_fee_usd": float(restore["swap_fee_usd"]),
+            "unfilled_usd": float(restore["unfilled_usd"]),
+            "wallet_after": {
+                "usdc": float(restore["end_usdc"]),
+                "eth": float(restore["end_eth"]),
+                "value_usd": float(restore["end_usdc"] + restore["end_eth"] * final_price_for_restore),
+            },
+        }
+        log(
+            "  >> FINAL RESTORE @ $%.0f | swap=$%.2f fee=$%.2f unfilled=$%.2f"
+            % (
+                final_price_for_restore,
+                restore["swap_amount_usd"],
+                restore["swap_fee_usd"],
+                restore["unfilled_usd"],
+            )
+        )
+
     if telemetry is not None:
         final_ts = int(candles[-1]["periodStartUnix"])
         final_price = float(candles[-1]["close"]) if price_token == 0 else 1.0 / float(candles[-1]["close"])
@@ -1092,6 +1693,9 @@ def simulate(
                 "strategy_total_value_usd": round(wallet["usdc"] + wallet["eth"] * final_price, 2),
                 "final_wallet": {"usdc": round(wallet["usdc"], 2), "eth": round(wallet["eth"], 6)},
                 "positions": len(positions),
+                "anchor_usdc": (round(anchor_usdc, 2) if anchor_usdc is not None else None),
+                "anchor_eth": (round(anchor_eth, 6) if anchor_eth is not None else None),
+                "final_restore": final_restore_record,
             },
         )
 
@@ -1105,6 +1709,21 @@ def simulate(
             n_book_open, len(positions), n_book_close, len(positions),
             st["cache_hits"], st["cache_misses"], st["empty_responses"], st["errors"],
         )
+
+    # Stash restore-to-anchor metadata on the returned wallet (sentinel keys
+    # prefixed with ``__`` so legacy consumers ignore them). build_summary
+    # picks these up to compute the new headline ROI; tests that only read
+    # ``usdc``/``eth`` are unaffected.
+    if anchor_usdc is not None:
+        wallet["__anchor_usdc__"] = float(anchor_usdc)
+    if anchor_eth is not None:
+        wallet["__anchor_eth__"] = float(anchor_eth)
+    if final_restore_record is not None:
+        wallet["__final_restore__"] = final_restore_record
+    wallet["__restore_to_anchor__"] = bool(restore_to_anchor)
+    wallet["__hedge_sizing_mode__"] = str(hedge_sizing_mode)
+    wallet["__hedge_lp_fee_credit_pct__"] = float(hedge_lp_fee_credit_pct or 0.0)
+    wallet["__pool_swap_fee_rate__"] = float(pool_swap_fee_rate)
 
     return positions, wallet, snapshots
 
@@ -1145,6 +1764,37 @@ def build_summary(
     total_polymarket_fees = sum(
         p.get("polymarket_fee_buy", 0.0) + p.get("polymarket_fee_sell", 0.0) for p in positions
     )
+
+    # ------------------------------------------------------------------
+    # Restore-to-anchor aggregates.
+    # ------------------------------------------------------------------
+    restore_to_anchor_on = bool(final_wallet.get("__restore_to_anchor__", False))
+    anchor_usdc_meta = final_wallet.get("__anchor_usdc__")
+    anchor_eth_meta = final_wallet.get("__anchor_eth__")
+    final_restore_meta = final_wallet.get("__final_restore__")
+    hedge_sizing_mode_meta = str(final_wallet.get("__hedge_sizing_mode__", "il_only"))
+    hedge_lp_fee_credit_pct_meta = float(final_wallet.get("__hedge_lp_fee_credit_pct__", 0.0) or 0.0)
+    pool_swap_fee_rate_meta = float(final_wallet.get("__pool_swap_fee_rate__", 0.0) or 0.0)
+
+    total_restore_swap_fees = sum(p.get("restore_swap_fee", 0.0) for p in positions)
+    total_restore_swap_amount = sum(p.get("restore_swap_amount", 0.0) for p in positions)
+    # IMPORTANT: per-position ``restore_unfilled_usd`` is the *cumulative*
+    # wallet-vs-anchor gap after that close (because the restore swap targets
+    # the same anchor every time, so the prior round's surplus is rolled into
+    # the next wallet). Summing it would double-count. The end-state value is
+    # the last close's unfilled (or the final-restore unfilled when present).
+    if final_restore_meta:
+        cumulative_unfilled_usd = float(final_restore_meta.get("unfilled_usd", 0.0) or 0.0)
+        total_restore_swap_fees += float(final_restore_meta.get("swap_fee_usd", 0.0) or 0.0)
+        total_restore_swap_amount += float(final_restore_meta.get("swap_amount_usd", 0.0) or 0.0)
+    else:
+        # Fallback: pick the last position with a recorded restore_unfilled_usd
+        # (i.e. the most recent close in restore mode). Zero when nothing ran.
+        cumulative_unfilled_usd = 0.0
+        for p in reversed(positions):
+            if "restore_unfilled_usd" in p:
+                cumulative_unfilled_usd = float(p.get("restore_unfilled_usd", 0.0) or 0.0)
+                break
 
     # ---- Opportunity cost on capital that is NOT earning the risk-free rate ----
     # Two forgone-yield buckets:
@@ -1207,8 +1857,22 @@ def build_summary(
     final_value = final_wallet["usdc"] + final_wallet["eth"] * final_price
 
     polymarket_proceeds = total_ins_payout + total_ins_sellback
-    cost_basis = investment + total_gas_fees + total_ins_cost
-    final_total_value = final_value + polymarket_proceeds
+    if restore_to_anchor_on and anchor_usdc_meta is not None and anchor_eth_meta is not None:
+        # Restore-to-anchor headline accounting:
+        # - Money out (cost basis) = investment + gas + premium. (Restore swap
+        #   fees are NOT added separately because they are already netted into
+        #   ``cumulative_unfilled_usd`` via the per-close swap accounting.)
+        # - Money in / out at end (final value) = anchor value at final price
+        #   plus the cumulative surplus/deficit we tracked across rounds.
+        # Insurance proceeds DO show up — they are baked into each round's
+        # ``restore_unfilled_usd`` (since the restore swap consumed payout +
+        # sellback as available USDC). So we do NOT add them here a second time.
+        cost_basis = investment + total_gas_fees + total_ins_cost
+        anchor_value_at_final = float(anchor_usdc_meta) + float(anchor_eth_meta) * final_price
+        final_total_value = anchor_value_at_final + cumulative_unfilled_usd
+    else:
+        cost_basis = investment + total_gas_fees + total_ins_cost
+        final_total_value = final_value + polymarket_proceeds
 
     roi_pct = (final_total_value / cost_basis - 1) * 100 if cost_basis else 0.0
     try:
@@ -1262,6 +1926,53 @@ def build_summary(
             "insurance_net_usdc": round(p["insurance_net"], 2),
             "touched_lower": p.get("touched_lower", False),
             "touched_upper": p.get("touched_upper", False),
+            # Per-leg market metadata so a downstream auditor can
+            # reproduce which Polymarket markets were actually used at
+            # each open and check their depth (cumulative USD volume).
+            "lower_clob_token_id": p.get("lower_clob_token_id"),
+            "upper_clob_token_id": p.get("upper_clob_token_id"),
+            "lower_market_volume_usd": round(float(p.get("lower_market_volume") or 0.0), 2),
+            "upper_market_volume_usd": round(float(p.get("upper_market_volume") or 0.0), 2),
+            # Pool-dilution telemetry. ``avg_dilution_factor`` is the mean
+            # multiplier applied to the historical fee-growth (1.0 == no
+            # dilution, 0.5 == fees halved). ``avg_pool_share`` is the
+            # complementary "us / (us + pool)" share. Both averaged across
+            # in-position hours.
+            "avg_dilution_factor": (
+                round(p["dilution_factor_sum"] / p["dilution_sample_count"], 6)
+                if p.get("dilution_sample_count") else None
+            ),
+            "avg_pool_share": (
+                round(p["our_L_share_sum"] / p["dilution_sample_count"], 6)
+                if p.get("dilution_sample_count") else None
+            ),
+            "avg_pool_active_liquidity": (
+                round(p["pool_L_sample_sum"] / p["dilution_sample_count"], 4)
+                if p.get("dilution_sample_count") else None
+            ),
+            # Restore-to-anchor extras (zero / null when restore mode is off).
+            "anchor_usdc": (round(float(p["anchor_usdc"]), 2) if p.get("anchor_usdc") is not None else None),
+            "anchor_eth": (round(float(p["anchor_eth"]), 6) if p.get("anchor_eth") is not None else None),
+            "restore_cost_lower_usdc": round(p.get("restore_cost_lower", 0.0) or 0.0, 2),
+            "restore_cost_upper_usdc": round(p.get("restore_cost_upper", 0.0) or 0.0, 2),
+            "restore_swap_amount_usd": round(p.get("restore_swap_amount", 0.0) or 0.0, 2),
+            "restore_swap_fee_usd": round(p.get("restore_swap_fee", 0.0) or 0.0, 2),
+            "restore_unfilled_usd": round(p.get("restore_unfilled_usd", 0.0) or 0.0, 2),
+            "wallet_vs_anchor_usd": round(p.get("wallet_vs_anchor_usd", 0.0) or 0.0, 2),
+            "wallet_at_close_pre_restore": (
+                {
+                    t0_sym: round(p["wallet_at_close_pre_restore"]["usdc"], 2),
+                    t1_sym: round(p["wallet_at_close_pre_restore"]["eth"], 6),
+                    "value_usd": round(p["wallet_at_close_pre_restore"]["value_usd"], 2),
+                } if p.get("wallet_at_close_pre_restore") else None
+            ),
+            "wallet_after_restore": (
+                {
+                    t0_sym: round(p["wallet_after_restore"]["usdc"], 2),
+                    t1_sym: round(p["wallet_after_restore"]["eth"], 6),
+                    "value_usd": round(p["wallet_after_restore"]["value_usd"], 2),
+                } if p.get("wallet_after_restore") else None
+            ),
         })
 
     # Reconstruct an unhedged variant PnL from the existing position records.
@@ -1281,9 +1992,9 @@ def build_summary(
     try:
         unhedged_apy = (
             ((unhedged_strategy_value / unhedged_cost_basis) ** (365 / total_days) - 1) * 100
-            if total_days > 0 and unhedged_strategy_value > 0 else 0
+            if total_days > 0 and unhedged_strategy_value > 0 and unhedged_cost_basis > 0 else 0
         )
-    except OverflowError:
+    except (OverflowError, ZeroDivisionError):
         unhedged_apy = float("inf") if unhedged_strategy_value > unhedged_cost_basis else float("-inf")
 
     hodl_final_value = initial_usdc + initial_eth * final_price
@@ -1292,6 +2003,41 @@ def build_summary(
         hodl_apy = ((hodl_final_value / investment) ** (365 / total_days) - 1) * 100 if total_days > 0 and hodl_final_value > 0 else 0
     except OverflowError:
         hodl_apy = float("inf") if hodl_final_value > investment else float("-inf")
+
+    # ------------------------------------------------------------------
+    # REAL-CASH-TERMS metric (the honest "did I make money?" number).
+    # ------------------------------------------------------------------
+    # The simulator uses external-cost accounting: insurance proceeds
+    # (payouts + sellback) are added INTO the wallet at close, but the
+    # premium PAID is never subtracted from the wallet. So the headline
+    # "wallet vs HODL" silently treats premium as funded from a separate
+    # pocket. To answer "would my real cash beat HODL?" we have to
+    # subtract the gross premium back out:
+    #
+    #   real_cash_final = sim_wallet_final - gross_premium_paid
+    #                                       + gas_total (gas already inside?)
+    #
+    # gas in this codebase is *also* external (paid outside the wallet),
+    # so total external outflow = total_ins_cost + total_gas_fees.
+    # Restore swap fees are inside-wallet (deducted at restore time), so
+    # we don't subtract them here. Insurance proceeds are inside-wallet
+    # too (already in final_value), so we don't add them here either.
+    real_cash_final_value = final_value - total_ins_cost - total_gas_fees
+    real_cash_vs_hodl_usd = real_cash_final_value - hodl_final_value
+    real_cash_roi_pct = (
+        (real_cash_final_value / investment - 1) * 100 if investment else 0
+    )
+    try:
+        real_cash_apy = (
+            ((real_cash_final_value / investment) ** (365 / total_days) - 1) * 100
+            if total_days > 0 and real_cash_final_value > 0 and investment > 0 else
+            (float("-inf") if real_cash_final_value <= 0 else 0)
+        )
+    except (OverflowError, ZeroDivisionError):
+        real_cash_apy = float("-inf") if real_cash_final_value <= 0 else (
+            float("inf") if real_cash_final_value > investment else float("-inf")
+        )
+    real_cash_outperformance_pct = real_cash_roi_pct - hodl_roi_pct
 
     # Polymarket execution: what we paid/received at DB mid vs with execution costs.
     buy_premium_usd = sum(p.get("spread_cost_buy", 0.0) + p.get("slippage_cost_buy", 0.0) for p in positions)
@@ -1400,6 +2146,30 @@ def build_summary(
                 "outperformance_vs_hodl_usd": round(final_value - hodl_final_value, 2),
                 "outperformance_vs_hodl_pct": round(roi_pct - hodl_roi_pct, 2),
             },
+            # ----------------------------------------------------------
+            # REAL CASH TERMS — the honest answer.
+            # The sim's "Wallet vs HODL" silently treats insurance premium
+            # as funded from a separate pocket (external-cost accounting).
+            # In real life premium is YOUR cash. This block subtracts it back
+            # so the operator sees the actual P&L they would experience.
+            # ----------------------------------------------------------
+            "real_cash_terms": {
+                "real_cash_final_value_usd": round(real_cash_final_value, 2),
+                "real_cash_roi_pct": round(real_cash_roi_pct, 2),
+                "real_cash_apy_pct": round(real_cash_apy, 2) if real_cash_apy not in (float("inf"), float("-inf")) else None,
+                "real_cash_vs_hodl_usd": round(real_cash_vs_hodl_usd, 2),
+                "real_cash_vs_hodl_pct": round(real_cash_outperformance_pct, 2),
+                "gross_premium_paid_usd": round(total_ins_cost, 2),
+                "gas_paid_external_usd": round(total_gas_fees, 2),
+                "note": (
+                    "real_cash_final = sim_wallet_final - gross_premium - gas. "
+                    "Subtracts the external-cost outflows (insurance premium "
+                    "and gas) the sim does not deduct from the LP wallet. "
+                    "This is the metric to use when judging whether the "
+                    "strategy actually makes money on the same starting cash "
+                    "as a HODLer would have."
+                ),
+            },
             "unhedged_active_lp": {
                 "final_value_usd": round(unhedged_strategy_value, 2),
                 "roi_pct": round(unhedged_roi_pct, 2),
@@ -1449,6 +2219,44 @@ def build_summary(
             if edge_lp_plus_hedge_usd is not None and edge_lp_plus_hedge_pct is not None
             else {}
         ),
+        "restore_to_anchor": {
+            "enabled": restore_to_anchor_on,
+            "hedge_sizing_mode": hedge_sizing_mode_meta,
+            "hedge_lp_fee_credit_pct": round(hedge_lp_fee_credit_pct_meta, 4),
+            "pool_swap_fee_rate": round(pool_swap_fee_rate_meta, 6),
+            "anchor": (
+                {
+                    t0_sym: round(float(anchor_usdc_meta), 2),
+                    t1_sym: round(float(anchor_eth_meta), 6),
+                    "value_at_entry_usd": round(
+                        float(anchor_usdc_meta) + float(anchor_eth_meta) * entry_price, 2,
+                    ),
+                    "value_at_final_usd": round(
+                        float(anchor_usdc_meta) + float(anchor_eth_meta) * final_price, 2,
+                    ),
+                }
+                if anchor_usdc_meta is not None and anchor_eth_meta is not None
+                else None
+            ),
+            "cumulative_unfilled_usd": round(cumulative_unfilled_usd, 2),
+            "total_restore_swap_fees_usd": round(total_restore_swap_fees, 2),
+            "total_restore_swap_amount_usd": round(total_restore_swap_amount, 2),
+            "final_restore": (
+                {
+                    "swap_amount_usd": round(float(final_restore_meta["swap_amount_usd"]), 2),
+                    "swap_fee_usd": round(float(final_restore_meta["swap_fee_usd"]), 2),
+                    "unfilled_usd": round(float(final_restore_meta["unfilled_usd"]), 2),
+                    "wallet_after": final_restore_meta.get("wallet_after"),
+                }
+                if final_restore_meta else None
+            ),
+            "headline_roi_pct": round(roi_pct, 2) if restore_to_anchor_on else None,
+            "headline_final_value_usd": round(final_total_value, 2) if restore_to_anchor_on else None,
+            "note": (
+                "headline ROI uses anchor_value_at_final + cumulative_unfilled_usd "
+                "(insurance proceeds are netted into per-close restore_unfilled_usd)."
+            ),
+        },
         "data_quality": data_quality or {},
         "run_metadata": run_metadata or {},
         "positions": pos_records,
@@ -1634,6 +2442,124 @@ def main():
     polymarket_fees_enabled = bool(bt.get("polymarket_fees_enabled", True))
     # External-cost accounting is always ON (no config flag).
 
+    # Experiment matrix knobs (all optional — null/default keeps legacy behaviour).
+    selection_cfg: Dict[str, Any] = {}
+    _yes_cap = bt.get("range_yes_cap")
+    if _yes_cap is not None:
+        selection_cfg["range_yes_cap"] = float(_yes_cap)
+    _min_tte = bt.get("min_hedge_tte_hours")
+    if _min_tte is not None:
+        selection_cfg["min_hedge_tte_hours"] = float(_min_tte)
+    _objective = bt.get("selection_objective")
+    if _objective:
+        selection_cfg["selection_objective"] = str(_objective)
+    _fixed_w = bt.get("fixed_range_pct")
+    if _fixed_w is not None:
+        selection_cfg["fixed_range_pct"] = float(_fixed_w)
+    _buffer = bt.get("range_buffer_pct")
+    if _buffer is not None:
+        selection_cfg["range_buffer_pct"] = float(_buffer)
+    _max_w = bt.get("range_max_width_pct")
+    if _max_w is not None:
+        selection_cfg["range_max_width_pct"] = float(_max_w)
+    if bool(bt.get("bypass_insurance", False)):
+        selection_cfg["bypass_insurance"] = True
+    if bool(bt.get("relax_filters_when_empty", False)):
+        selection_cfg["relax_filters_when_empty"] = True
+    # Depth-aware market selection (default-on): refuse ghost markets and
+    # let pick_best_range / get_candidate_markets order by depth.
+    _min_vol = bt.get("min_market_volume_usd")
+    if _min_vol is None:
+        _min_vol = 1000.0  # ghost-market floor
+    selection_cfg["min_market_volume"] = float(_min_vol or 0.0)
+    selection_cfg["restrict_to_touch_markets"] = bool(restrict_to_touch_markets)
+    selection_cfg["slippage_per_1k_default"] = float(slippage_per_1k or 0.02)
+    selection_cfg["spread"] = float(spread or 0.0)
+    selection_cfg = selection_cfg or None
+    if selection_cfg:
+        logger.info("Selection knobs active: %s", selection_cfg)
+
+    # Restore-to-anchor knobs (defaults preserve legacy behaviour).
+    restore_to_anchor = bool(bt.get("restore_to_anchor", False))
+    hedge_sizing_mode = str(bt.get("hedge_sizing_mode", "il_only") or "il_only")
+    hedge_lp_fee_credit_pct = float(bt.get("hedge_lp_fee_credit_pct", 0.0) or 0.0)
+    final_restore_at_end = bool(bt.get("final_restore_at_end", False))
+    _mih_raw = bt.get("max_idle_hours")
+    max_idle_hours = float(_mih_raw) if (_mih_raw is not None and float(_mih_raw) > 0) else None
+    require_full_insurance = bool(bt.get("require_full_insurance", False))
+    if require_full_insurance:
+        logger.info("require_full_insurance ON — positions with insurance_cost=$0 will be skipped")
+    _tp_raw = bt.get("take_profit_yes_multiplier")
+    take_profit_yes_multiplier = (
+        float(_tp_raw) if (_tp_raw is not None and float(_tp_raw) > 0) else None
+    )
+    if take_profit_yes_multiplier is not None:
+        logger.info(
+            "take_profit_yes_multiplier=%.2fx — each YES leg is hourly MTM-checked; "
+            "sell when sell-side proceeds >= %.2fx of buy cost.",
+            take_profit_yes_multiplier, take_profit_yes_multiplier,
+        )
+    # ----- Phase 30 vol-regime knobs -----
+    vol_regime_toggle = bool(bt.get("vol_regime_toggle", False))
+    vol_regime_threshold_pct = bt.get("vol_regime_threshold_pct")
+    if vol_regime_threshold_pct is not None:
+        try:
+            vol_regime_threshold_pct = float(vol_regime_threshold_pct)
+        except (TypeError, ValueError):
+            vol_regime_threshold_pct = None
+    vol_regime_lookback_hours = int(bt.get("vol_regime_lookback_hours", 24) or 24)
+    vol_regime_forecast_mode = str(bt.get("vol_regime_forecast_mode", "perfect"))
+    if vol_regime_toggle:
+        logger.info(
+            "vol_regime_toggle ON: %s-forecast hourly-stddev over next/last %dh; "
+            "skip cycle when realised vol > %.3f%%.",
+            vol_regime_forecast_mode, vol_regime_lookback_hours,
+            vol_regime_threshold_pct or float("nan"),
+        )
+    conditional_hedging = bool(bt.get("conditional_hedging", False))
+    conditional_hedging_threshold_pct = bt.get("conditional_hedging_threshold_pct")
+    if conditional_hedging_threshold_pct is not None:
+        try:
+            conditional_hedging_threshold_pct = float(conditional_hedging_threshold_pct)
+        except (TypeError, ValueError):
+            conditional_hedging_threshold_pct = None
+    conditional_hedging_lookback_hours = int(bt.get("conditional_hedging_lookback_hours", 168) or 168)
+    conditional_hedging_forecast_mode = str(bt.get("conditional_hedging_forecast_mode", "perfect"))
+    if conditional_hedging:
+        logger.info(
+            "conditional_hedging ON: %s-forecast hourly-stddev over next/last %dh; "
+            "bypass insurance when realised vol <= %.3f%%.",
+            conditional_hedging_forecast_mode, conditional_hedging_lookback_hours,
+            conditional_hedging_threshold_pct or float("nan"),
+        )
+    # ----- Phase 31 Beefy ConcLiq knobs -----
+    symmetric_range_pct = bt.get("symmetric_range_pct")
+    if symmetric_range_pct is not None:
+        try:
+            symmetric_range_pct = float(symmetric_range_pct)
+            if symmetric_range_pct <= 0:
+                symmetric_range_pct = None
+        except (TypeError, ValueError):
+            symmetric_range_pct = None
+    if symmetric_range_pct is not None:
+        logger.info(
+            "symmetric_range_pct=%.2f%% — Beefy ConcLiq mode: each open builds a "
+            "synthetic [P*(1-w/2), P*(1+w/2)] range. Requires bypass_insurance=True.",
+            symmetric_range_pct,
+        )
+    alt_fee_uplift_pct = float(bt.get("alt_fee_uplift_pct", 0.0) or 0.0)
+    if alt_fee_uplift_pct > 0:
+        logger.info(
+            "alt_fee_uplift_pct=%.1f%% — boost main-range LP fees to approximate "
+            "the Beefy alt single-sided position's contribution.",
+            alt_fee_uplift_pct,
+        )
+    if restore_to_anchor:
+        logger.info(
+            "Restore-to-anchor mode ON (hedge_sizing_mode=%s, lp_fee_credit_pct=%.2f, final_restore=%s)",
+            hedge_sizing_mode, hedge_lp_fee_credit_pct, final_restore_at_end or True,
+        )
+
     telemetry_cfg = bt.get("telemetry") or {}
     telemetry_enabled = bool(telemetry_cfg.get("enabled", False))
     telemetry_path = telemetry_cfg.get("path")
@@ -1644,11 +2570,40 @@ def main():
 
     logger.info(f"Fetching pool metadata for {pool}...")
     pool_data = fetch_pool_metadata(pool)
-    token_symbol = _map_wrapped_symbol(pool_data["token1"]["symbol"])
-    logger.info(f"Pool: {pool_data['token0']['symbol']}/{pool_data['token1']['symbol']} -> token={token_symbol}")
+    detected_symbol, detected_price_token = detect_pool_orientation(pool_data)
+    # If the user pinned price_token in config, respect it; otherwise use the
+    # auto-detected orientation so e.g. WBTC/USDC (token0=WBTC) works without
+    # the caller having to know the token order.
+    if bt.get("price_token") is None:
+        price_token = detected_price_token
+    token_symbol = detected_symbol
+    logger.info(
+        "Pool: %s/%s -> volatile=%s  price_token=%d (auto-detected)",
+        pool_data["token0"]["symbol"],
+        pool_data["token1"]["symbol"],
+        token_symbol,
+        price_token,
+    )
 
-    now = datetime.now(timezone.utc)
-    end_ts = int(now.timestamp())
+    # Allow a fixed window end via config to keep sweeps deterministic across
+    # subprocess invocations (without this each child has its own ``now()``
+    # and the 180-day window slides between configs in the same sweep,
+    # invalidating apples-to-apples comparisons).
+    _pinned_end_ts = bt.get("simulation_end_ts")
+    if _pinned_end_ts is not None:
+        try:
+            end_ts = int(_pinned_end_ts)
+            now = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+            logger.info(
+                "simulation_end_ts pinned via config: %s (epoch %d)",
+                now.isoformat(), end_ts,
+            )
+        except (TypeError, ValueError):
+            now = datetime.now(timezone.utc)
+            end_ts = int(now.timestamp())
+    else:
+        now = datetime.now(timezone.utc)
+        end_ts = int(now.timestamp())
     total_fetch_days = days + lookback_days
     start_ts = int((now - timedelta(days=total_fetch_days)).timestamp())
 
@@ -1712,7 +2667,22 @@ def main():
         else:
             raise ValueError('backtest.fixed_range must be null, "min,max", or [min, max]')
 
-    conn = get_db_connection()
+    # Pure LP replay (Phase 31 Beefy): synthetic symmetric range + bypass_insurance never
+    # touches Polymarket tables — skip Postgres so installs without a polymarket DB still run.
+    _beefy_no_poly = (
+        not sweep
+        and symmetric_range_pct is not None
+        and isinstance(selection_cfg, dict)
+        and bool(selection_cfg.get("bypass_insurance"))
+    )
+    if _beefy_no_poly:
+        conn = None
+        logger.info(
+            "Skipping PostgreSQL connection (symmetric_range_pct + bypass_insurance); "
+            "Polymarket/insurance leg is disabled for this config.",
+        )
+    else:
+        conn = get_db_connection()
     try:
         if sweep:
             results = run_sweep(
@@ -1779,6 +2749,24 @@ def main():
                 restrict_to_touch_markets=restrict_to_touch_markets,
                 polymarket_fee_category=polymarket_fee_category,
                 polymarket_fees_enabled=polymarket_fees_enabled,
+                selection_cfg=selection_cfg,
+                restore_to_anchor=restore_to_anchor,
+                hedge_sizing_mode=hedge_sizing_mode,
+                hedge_lp_fee_credit_pct=hedge_lp_fee_credit_pct,
+                final_restore_at_end=final_restore_at_end,
+                max_idle_hours=max_idle_hours,
+                require_full_insurance=require_full_insurance,
+                take_profit_yes_multiplier=take_profit_yes_multiplier,
+                vol_regime_toggle=vol_regime_toggle,
+                vol_regime_threshold_pct=vol_regime_threshold_pct,
+                vol_regime_lookback_hours=vol_regime_lookback_hours,
+                vol_regime_forecast_mode=vol_regime_forecast_mode,
+                conditional_hedging=conditional_hedging,
+                conditional_hedging_threshold_pct=conditional_hedging_threshold_pct,
+                conditional_hedging_lookback_hours=conditional_hedging_lookback_hours,
+                conditional_hedging_forecast_mode=conditional_hedging_forecast_mode,
+                symmetric_range_pct=symmetric_range_pct,
+                alt_fee_uplift_pct=alt_fee_uplift_pct,
             )
 
             poly_report = validate_polymarket_coverage(hourly_snapshots)
@@ -1810,6 +2798,10 @@ def main():
                 "warnings": [],
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "sweep_table_path": sweep_out,
+                "restore_to_anchor": restore_to_anchor,
+                "hedge_sizing_mode": hedge_sizing_mode,
+                "hedge_lp_fee_credit_pct": hedge_lp_fee_credit_pct,
+                "final_restore_at_end": final_restore_at_end or restore_to_anchor,
             }
             summary = build_summary(
                 positions, candles, 0.0, pool, token_symbol, final_wallet, price_token,
@@ -1851,6 +2843,24 @@ def main():
                 restrict_to_touch_markets=restrict_to_touch_markets,
                 polymarket_fee_category=polymarket_fee_category,
                 polymarket_fees_enabled=polymarket_fees_enabled,
+                selection_cfg=selection_cfg,
+                restore_to_anchor=restore_to_anchor,
+                hedge_sizing_mode=hedge_sizing_mode,
+                hedge_lp_fee_credit_pct=hedge_lp_fee_credit_pct,
+                final_restore_at_end=final_restore_at_end,
+                max_idle_hours=max_idle_hours,
+                require_full_insurance=require_full_insurance,
+                take_profit_yes_multiplier=take_profit_yes_multiplier,
+                vol_regime_toggle=vol_regime_toggle,
+                vol_regime_threshold_pct=vol_regime_threshold_pct,
+                vol_regime_lookback_hours=vol_regime_lookback_hours,
+                vol_regime_forecast_mode=vol_regime_forecast_mode,
+                conditional_hedging=conditional_hedging,
+                conditional_hedging_threshold_pct=conditional_hedging_threshold_pct,
+                conditional_hedging_lookback_hours=conditional_hedging_lookback_hours,
+                conditional_hedging_forecast_mode=conditional_hedging_forecast_mode,
+                symmetric_range_pct=symmetric_range_pct,
+                alt_fee_uplift_pct=alt_fee_uplift_pct,
             )
             poly_report = validate_polymarket_coverage(hourly_snapshots)
             if poly_report.position_hours and (
@@ -1924,6 +2934,11 @@ def main():
                 "incomplete": incomplete,
                 "warnings": warnings,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
+                "selection_cfg": selection_cfg,
+                "restore_to_anchor": restore_to_anchor,
+                "hedge_sizing_mode": hedge_sizing_mode,
+                "hedge_lp_fee_credit_pct": hedge_lp_fee_credit_pct,
+                "final_restore_at_end": final_restore_at_end or restore_to_anchor,
             }
             summary = build_summary(
                 positions, candles, 0.0, pool, token_symbol, final_wallet, price_token,
@@ -1996,4 +3011,5 @@ def main():
             logger.info(f"\nResults saved to {output_path}")
 
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()

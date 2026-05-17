@@ -23,6 +23,9 @@ sweep_*.json
 backtest_results.json
 optimization_results.json
 
+# Sweep / experiment outputs created by scripts/run_sweep_*.py
+runs/
+
 logs/
 
 .DS_Store

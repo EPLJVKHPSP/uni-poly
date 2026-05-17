@@ -16,41 +16,47 @@ ClosePolicy = Literal["touch", "next_candle", "pessimistic"]
 # Polymarket dynamic taker-fee model
 # ---------------------------------------------------------------------------
 #
-# As of March 2026 Polymarket charges a probability-weighted *taker* fee.
-# The formula is::
+# As of 2026 Polymarket charges a probability-weighted *taker* fee.
+# The official formula (docs.polymarket.com/trading/fees) is::
 #
-#     fee_usd = C × feeRate × (p × (1 - p))^exponent
+#     fee_usd = C × feeRate × p × (1 - p)
 #
-# (The Polymarket docs page mis-states the formula with an extra ``× p`` term,
-# but the published per-category fee tables and the worked examples in their
-# own documentation only match this form: for Crypto with exp=1 the peak is
-# 1.80% at p=0.5 (100 × 0.072 × 0.25 = 1.80) and for "Other" with exp=2 the
-# peak is 1.25% (0.2 × 0.0625 = 0.0125).)
+# where C is the number of shares, p is the trade price (0..1), and
+# ``feeRate`` is a per-category constant.
 #
-# Where C is the number of shares, p is the trade price (0..1), and
-# (feeRate, exponent) is a per-category constant. Makers pay 0 (and receive
-# rebates) but our hedge uses taker fills at open/close, so we charge the
-# full taker rate. Geopolitics is fee-free; everything else (Crypto included)
-# pays the dynamic curve below.
+# We keep an ``exponent`` field on PolymarketFeeModel for forward-compat
+# (the on-chain ``info.fd`` blob exposes ``e`` separately and Polymarket
+# could in principle change it), but every published category currently
+# uses exponent = 1. Setting exp=1 reduces ``(p×(1−p))^exp`` to the
+# linear ``p×(1−p)`` form documented above.
+#
+# Verified against the published per-category fee tables for 100 shares:
+#   Crypto    feeRate=0.07  → peak $1.75 @ p=0.5; $0.63 @ p=0.10
+#   Sports    feeRate=0.03  → peak $0.75 @ p=0.5
+#   Finance/Politics/Mentions/Tech feeRate=0.04 → peak $1.00 @ p=0.5
+#   Economics/Culture/Weather/Other feeRate=0.05 → peak $1.25 @ p=0.5
+#
+# Makers pay 0 (and receive rebates) but our hedge uses taker fills at
+# open/close, so we charge the full taker rate. Geopolitics is fee-free.
 #
 # The p × (1 - p) term peaks at p = 0.5 and decays to ~0 at the extremes,
 # which is convenient for our hedge: the legs we actually trade are usually
-# at p ≤ 0.20, where the effective taker rate is far below the headline 1.8%.
-# Source: docs.polymarket.com/trading/fees
+# at p ≤ 0.20, where the effective taker rate is far below the headline 1.75%.
 
 POLYMARKET_FEE_TABLE: Dict[str, tuple[float, float]] = {
-    # category -> (feeRate, exponent)
-    "crypto":     (0.072, 1.0),   # peak 1.80% @ p=0.5
-    "sports":     (0.030, 1.0),   # peak 0.75%
-    "finance":    (0.040, 1.0),
-    "politics":   (0.040, 1.0),
-    "economics":  (0.050, 1.0),
-    "culture":    (0.050, 1.0),
-    "weather":    (0.050, 1.0),
-    "general":    (0.050, 1.0),
-    "other":      (0.200, 2.0),
-    "mentions":   (0.250, 2.0),
-    "geopolitics": (0.0, 1.0),    # fee-free
+    # category -> (feeRate, exponent)   per docs.polymarket.com/trading/fees
+    "crypto":      (0.07, 1.0),   # peak $1.75 / 100 sh @ p=0.5
+    "sports":      (0.03, 1.0),   # peak $0.75 / 100 sh
+    "finance":     (0.04, 1.0),   # peak $1.00 / 100 sh
+    "politics":    (0.04, 1.0),
+    "mentions":    (0.04, 1.0),
+    "tech":        (0.04, 1.0),
+    "economics":   (0.05, 1.0),   # peak $1.25 / 100 sh
+    "culture":     (0.05, 1.0),
+    "weather":     (0.05, 1.0),
+    "other":       (0.05, 1.0),
+    "general":     (0.05, 1.0),
+    "geopolitics": (0.0,  1.0),   # fee-free
 }
 
 MIN_FEE_USD = 1e-5  # Polymarket rounds anything below 0.00001 USDC to zero.
@@ -66,7 +72,7 @@ class PolymarketFeeModel:
     """
 
     category: str = "crypto"
-    fee_rate: float = 0.072
+    fee_rate: float = 0.07
     exponent: float = 1.0
     enabled: bool = True
 

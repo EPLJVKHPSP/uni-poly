@@ -21,6 +21,7 @@ from .fee_math import (  # noqa: F401
 
 from .range_selection import (  # noqa: F401
     _map_wrapped_symbol,
+    detect_pool_orientation,
     _filter_ranges_for_price,
     _score_range,
     pick_best_range,

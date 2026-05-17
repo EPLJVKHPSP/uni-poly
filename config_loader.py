@@ -7,6 +7,7 @@ runtime parameters. Entry scripts read from it rather than argparse flags.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -17,6 +18,12 @@ def default_config_path() -> Path:
 
 
 def load_config(path: Optional[str | Path] = None) -> Dict[str, Any]:
+    # Allow per-process config override (used by scripts/run_experiments.py)
+    # without requiring callers to plumb a path argument.
+    if path is None:
+        env_path = os.environ.get("BACKTEST_CONFIG_PATH")
+        if env_path:
+            path = env_path
     cfg_path = Path(path) if path is not None else default_config_path()
     if not cfg_path.exists():
         raise FileNotFoundError(f"Config file not found: {cfg_path}")
